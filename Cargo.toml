@@ -1,0 +1,23 @@
+[package]
+name = "minipaw"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny pure-Rust command line AI-agent skeleton for constrained hardware."
+license = "MIT"
+
+[features]
+default = []
+sqlite = []
+telegram = []
+llm-http = []
+tools-exec = []
+compact-memory = []
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"
+
+[dependencies]
