@@ -1,7 +1,7 @@
 use crate::llm::LlmClient;
 use crate::memory::ProgressiveMemory;
 use crate::skills::{Skill, SkillRegistry};
-use crate::types::{AgentPattern, Plan, PlanStep, PlanStepKind, StepStatus, Task};
+use crate::types::{AgentPattern, MessageClass, Plan, PlanStep, PlanStepKind, StepStatus, Task};
 
 #[derive(Debug, Default, Clone)]
 pub struct Planner;
@@ -417,12 +417,42 @@ fn is_stop_word(word: &str) -> bool {
     )
 }
 
+pub fn classify_message(context: &str, llm: &mut dyn LlmClient) -> MessageClass {
+    let prompt = format!(
+        "Classify the intent of this message into exactly one category.\n\
+         Categories:\n\
+         minihow - the user wants to execute something, perform an action, or get something done\n\
+         miniwhy - the user wants to understand, analyze, or reason about information\n\
+         miniwhat - the user wants to query or retrieve specific information\n\
+         Reply with only the category name.\n\
+         Message:\n{context}"
+    );
+    let response = llm.next_step(&prompt);
+    parse_message_class(&response).unwrap_or(MessageClass::MiniWhat)
+}
+
+fn parse_message_class(response: &str) -> Option<MessageClass> {
+    for line in response.lines().take(4) {
+        let lower = line.trim().to_ascii_lowercase();
+        if lower.contains("minihow") {
+            return Some(MessageClass::MiniHow);
+        }
+        if lower.contains("miniwhy") {
+            return Some(MessageClass::MiniWhy);
+        }
+        if lower.contains("miniwhat") {
+            return Some(MessageClass::MiniWhat);
+        }
+    }
+    None
+}
+
 pub fn help_text() -> String {
     [
         "minipaw commands:",
-        "run                         start interactive agent",
-        "task new <text>             create and run a task",
-        "telegram run                poll Telegram and answer paired chats",
+        "run                         start interactive agent (minicore)",
+        "task new <text>             create and run a task via minicore",
+        "telegram run                poll Telegram and answer paired chats via minicore",
         "task list                   list tasks",
         "memory get <key>            read memory",
         "memory set <key> <value>    write memory",
@@ -435,14 +465,13 @@ pub fn help_text() -> String {
         "config telegram pair <id>   allow one Telegram chat",
         "config telegram unpair <id> remove one Telegram chat",
         "config telegram show        show Telegram bot config",
+        "",
+        "REPL shortcuts (direct, no LLM classification):",
         "/ls [path]                  list directory",
         "/read <path>                read capped file",
         "/exec <program> [args...]   run allowlisted command",
-        "/enqueue <task>             queue a task for heartbeat tick",
-        "/tick                       run one loop tick",
-        "/heartbeat                  show loop heartbeat",
-        "/pipeline a | b | c         run pipeline stages",
-        "/mapreduce goal | a | b     run map-reduce supervisor",
+        "",
+        "Natural language goes through minicore advisor (minihow/miniwhy/miniwhat).",
     ]
     .join("\n")
 }

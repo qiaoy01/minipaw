@@ -50,6 +50,23 @@ pub struct Task {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageClass {
+    MiniHow,
+    MiniWhy,
+    MiniWhat,
+}
+
+impl fmt::Display for MessageClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MiniHow => f.write_str("minihow"),
+            Self::MiniWhy => f.write_str("miniwhy"),
+            Self::MiniWhat => f.write_str("miniwhat"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentPattern {
     Direct,
     CoordinatorWorker,
