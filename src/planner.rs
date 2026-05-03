@@ -1,5 +1,6 @@
 use crate::llm::LlmClient;
 use crate::memory::ProgressiveMemory;
+use crate::skills::SkillRegistry;
 use crate::types::{AgentPattern, Plan, PlanStep, PlanStepKind, StepStatus, Task};
 
 #[derive(Debug, Default, Clone)]
@@ -27,7 +28,14 @@ impl Planner {
     }
 
     pub fn plan(&self, task: &Task, llm: &mut dyn LlmClient) -> Plan {
-        self.plan_with_pattern(task, &task.title, AgentPattern::Direct, llm)
+        self.plan_with_context(
+            task,
+            &task.title,
+            AgentPattern::Direct,
+            &ProgressiveMemory::default(),
+            &SkillRegistry::default(),
+            llm,
+        )
     }
 
     pub fn plan_with_pattern(
@@ -37,7 +45,14 @@ impl Planner {
         pattern: AgentPattern,
         llm: &mut dyn LlmClient,
     ) -> Plan {
-        self.plan_with_context(task, input, pattern, &ProgressiveMemory::default(), llm)
+        self.plan_with_context(
+            task,
+            input,
+            pattern,
+            &ProgressiveMemory::default(),
+            &SkillRegistry::default(),
+            llm,
+        )
     }
 
     pub fn plan_with_context(
@@ -46,13 +61,15 @@ impl Planner {
         input: &str,
         pattern: AgentPattern,
         memory: &ProgressiveMemory,
+        skills: &SkillRegistry,
         llm: &mut dyn LlmClient,
     ) -> Plan {
         let text = input.trim();
         let kind = parse_local_intent(text).unwrap_or_else(|| {
-            let prompt = planner_prompt(pattern, text, memory);
-            let answer = llm.next_step(&prompt);
-            PlanStepKind::Answer(answer)
+            let prompt = planner_prompt(pattern, text, memory, skills);
+            let response = llm.next_step(&prompt);
+            // Let the LLM invoke a skill or fall back to a plain answer.
+            parse_skill_call(&response, skills).unwrap_or(PlanStepKind::Answer(response))
         });
 
         Plan {
@@ -64,6 +81,27 @@ impl Planner {
             }],
         }
     }
+}
+
+/// Parse a `SKILL: <name>` directive from the first few lines of an LLM
+/// response.  On a match, look up the skill's exec command and return the
+/// corresponding plan step.  Returns `None` when no directive is present or
+/// the named skill has no exec command.
+fn parse_skill_call(response: &str, registry: &SkillRegistry) -> Option<PlanStepKind> {
+    for line in response.lines().take(4) {
+        let trimmed = line.trim();
+        if !trimmed.to_ascii_lowercase().starts_with("skill:") {
+            continue;
+        }
+        let name = trimmed["skill:".len()..].trim();
+        let skill = registry.find(name)?;
+        let exec = skill.exec.as_deref()?;
+        let mut parts = exec.split_whitespace();
+        let program = parts.next()?.to_owned();
+        let args = parts.map(str::to_owned).collect();
+        return Some(PlanStepKind::Exec { program, args });
+    }
+    None
 }
 
 fn pattern_selection_prompt(input: &str, memory: &ProgressiveMemory) -> String {
@@ -191,21 +229,41 @@ fn parse_pattern_line(line: &str) -> Option<AgentPattern> {
     }
 }
 
-fn planner_prompt(pattern: AgentPattern, input: &str, memory: &ProgressiveMemory) -> String {
-    let memory = memory.render();
+fn planner_prompt(
+    pattern: AgentPattern,
+    input: &str,
+    memory: &ProgressiveMemory,
+    skills: &SkillRegistry,
+) -> String {
+    let memory_text = memory.render();
+    let skills_text = skills.index_text();
+    let skills_section = if skills_text.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n{skills_text}\
+             If a skill matches what is needed, respond with exactly:\n\
+             SKILL: <skill-name>\n\
+             Otherwise answer directly.\n"
+        )
+    };
     match pattern {
-        AgentPattern::Direct => format!("{memory}\nTask:\n{input}"),
+        AgentPattern::Direct => {
+            format!("{memory_text}{skills_section}\nTask:\n{input}")
+        }
         AgentPattern::CoordinatorWorker => format!(
-            "You are a worker sub-agent. Use progressive memory only as needed.\n{memory}\nComplete this assigned task concisely:\n{input}"
+            "You are a worker sub-agent. Use progressive memory only as needed.\n\
+             {memory_text}{skills_section}\nComplete this assigned task concisely:\n{input}"
         ),
         AgentPattern::HubAndSpoke => format!(
-            "You are behind a gateway in a hub-and-spoke agent. Use memory index first, details second. Produce the next safe response.\n{memory}\nTask:\n{input}"
+            "You are behind a gateway in a hub-and-spoke agent. Use memory index first, details second.\n\
+             {memory_text}{skills_section}\nTask:\n{input}"
         ),
         AgentPattern::Pipeline => {
-            format!("Produce the next pipeline stage output.\n{memory}\nTask:\n{input}")
+            format!("Produce the next pipeline stage output.\n{memory_text}{skills_section}\nTask:\n{input}")
         }
         AgentPattern::MapReduce => {
-            format!("Produce a map-reduce friendly answer.\n{memory}\nTask:\n{input}")
+            format!("Produce a map-reduce friendly answer.\n{memory_text}{skills_section}\nTask:\n{input}")
         }
     }
 }
@@ -229,8 +287,109 @@ fn parse_local_intent(input: &str) -> Option<PlanStepKind> {
             Some(PlanStepKind::Exec { program, args })
         }
         "/help" | "help" => Some(PlanStepKind::Answer(help_text())),
+        _ => parse_natural_action(input),
+    }
+}
+
+/// Map natural-language action phrases to tool plan steps.
+///
+/// Recognises:
+///   list/ls [path]          → ListDir
+///   read/cat <path>         → ReadFile
+///   run/exec/execute <prog> → Exec
+///
+/// Strips articles and common prepositions when searching for the path/program
+/// token so that "list the files in src" and "read the file src/main.rs" both
+/// resolve correctly.  Falls back to None for everything else so the LLM path
+/// handles knowledge questions.
+fn parse_natural_action(input: &str) -> Option<PlanStepKind> {
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let verb = tokens[0].to_ascii_lowercase();
+    match verb.as_str() {
+        "list" | "ls" => {
+            let path = first_path_token(&tokens[1..])
+                .map(str::to_owned)
+                .unwrap_or_else(|| ".".to_owned());
+            Some(PlanStepKind::ListDir(path))
+        }
+        "read" | "cat" => {
+            // Require an explicit path marker (/ or file extension) so that
+            // "read about X" or "read notes" fall through to the LLM instead
+            // of being mistaken for file reads.
+            let path = tokens[1..]
+                .iter()
+                .find(|t| looks_like_file_path(t))?
+                .to_string();
+            Some(PlanStepKind::ReadFile(path))
+        }
+        "run" | "exec" | "execute" => {
+            let program = tokens.get(1)?.to_string();
+            let args = tokens[2..].iter().map(|t| t.to_string()).collect();
+            Some(PlanStepKind::Exec { program, args })
+        }
         _ => None,
     }
+}
+
+/// Return the first token in `tokens` that looks like a file or directory path,
+/// skipping common English stop words (articles, prepositions, etc.).
+fn first_path_token<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+    for &token in tokens {
+        if is_path_like(token) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+/// Strict check: requires a directory separator or a filename extension so that
+/// plain words ("about", "notes", "sqlite") are never mistaken for file paths.
+fn looks_like_file_path(token: &str) -> bool {
+    if token.contains('/') || token.contains('\\') {
+        return true;
+    }
+    token
+        .rfind('.')
+        .map(|pos| pos > 0 && pos < token.len() - 1)
+        .unwrap_or(false)
+}
+
+fn is_path_like(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    // Contains a directory separator — definitely a path.
+    if token.contains('/') || token.contains('\\') {
+        return true;
+    }
+    // Has an internal dot that looks like a file extension (e.g. "README.md").
+    if let Some(pos) = token.rfind('.') {
+        if pos > 0 && pos < token.len() - 1 {
+            return true;
+        }
+    }
+    // Simple alphanumeric/dash/underscore identifier that is not a stop word.
+    token
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+        && !is_stop_word(token)
+}
+
+fn is_stop_word(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "the" | "a" | "an" | "all" | "file" | "files" | "dir" | "directory"
+            | "folder" | "folders" | "in" | "of" | "for" | "at" | "to" | "from"
+            | "about" | "with" | "on" | "by" | "as" | "into" | "through"
+            | "please" | "me" | "my" | "here" | "there" | "this" | "that"
+            | "it" | "them" | "they" | "him" | "her" | "us" | "you" | "we"
+            | "and" | "or" | "is" | "are" | "was" | "were" | "be" | "been"
+            | "have" | "has" | "had" | "do" | "does" | "did" | "will" | "would"
+            | "can" | "could" | "should" | "may" | "might" | "must" | "shall"
+    )
 }
 
 pub fn help_text() -> String {
@@ -268,6 +427,59 @@ mod tests {
         assert_eq!(
             parse_local_intent("/ls src"),
             Some(PlanStepKind::ListDir("src".into()))
+        );
+    }
+
+    #[test]
+    fn parses_natural_list_action() {
+        assert_eq!(
+            parse_natural_action("list src"),
+            Some(PlanStepKind::ListDir("src".into()))
+        );
+        assert_eq!(
+            parse_natural_action("ls ."),
+            Some(PlanStepKind::ListDir(".".into()))
+        );
+        assert_eq!(
+            parse_natural_action("list the files in src"),
+            Some(PlanStepKind::ListDir("src".into()))
+        );
+        // "list" with no path falls back to current directory.
+        assert_eq!(
+            parse_natural_action("list"),
+            Some(PlanStepKind::ListDir(".".into()))
+        );
+    }
+
+    #[test]
+    fn parses_natural_read_action() {
+        assert_eq!(
+            parse_natural_action("read src/main.rs"),
+            Some(PlanStepKind::ReadFile("src/main.rs".into()))
+        );
+        assert_eq!(
+            parse_natural_action("read the file README.md"),
+            Some(PlanStepKind::ReadFile("README.md".into()))
+        );
+        // No path-like token → returns None so LLM handles it.
+        assert_eq!(parse_natural_action("read about sqlite"), None);
+    }
+
+    #[test]
+    fn parses_natural_exec_action() {
+        assert_eq!(
+            parse_natural_action("run git status"),
+            Some(PlanStepKind::Exec {
+                program: "git".into(),
+                args: vec!["status".into()]
+            })
+        );
+        assert_eq!(
+            parse_natural_action("exec ls"),
+            Some(PlanStepKind::Exec {
+                program: "ls".into(),
+                args: vec![]
+            })
         );
     }
 

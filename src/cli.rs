@@ -1,9 +1,10 @@
 use std::env;
 use std::io::{self, BufRead, Write};
 
-use crate::agent::AgentOrchestrator;
+use crate::agent::{AgentOrchestrator, AgentOutcome};
 use crate::channels::telegram::{
-    get_updates, send_message, TelegramAdmission, TelegramChannel, TelegramConfig,
+    classify_message_kind, get_updates, normalize_action_text, send_message, MessageKind,
+    TelegramAdmission, TelegramChannel, TelegramConfig,
 };
 use crate::config::{
     pair_telegram_chat, read_file_config, unpair_telegram_chat, write_telegram_config, AgentConfig,
@@ -12,8 +13,9 @@ use crate::llm::{LlamaCppClient, LlmClient, OfflineLlm};
 use crate::memory::{InMemoryStore, MemoryStore};
 use crate::orchestration::PipelineStage;
 use crate::planner::help_text;
+use crate::skills::SkillRegistry;
 use crate::tools::{ToolPolicy, ToolRunner};
-use crate::types::TaskId;
+use crate::types::{TaskId, TaskStatus};
 
 pub fn run_from_env() -> io::Result<i32> {
     let workspace = env::current_dir()?;
@@ -31,18 +33,40 @@ struct App {
 
 impl App {
     fn new(config: AgentConfig) -> Self {
+        let skills = SkillRegistry::load(&config.workspace.join("skills"));
+        if !skills.is_empty() {
+            println!(
+                "skills loaded: {}",
+                skills
+                    .skills()
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        // Skills are operator-curated; auto-trust their exec programs so they
+        // don't require MINIPAW_ALLOW_EXEC in the environment.
+        let mut allow_exec = config.allow_exec;
+        let mut allowed_exec = config.allowed_exec.clone();
+        if !skills.is_empty() {
+            allow_exec = true;
+            for prog in skills.exec_programs() {
+                allowed_exec.insert(prog.to_owned());
+            }
+        }
         let policy = ToolPolicy {
             workspace: config.workspace.clone(),
             max_file_bytes: config.max_file_bytes,
             max_output_bytes: config.max_tool_output_bytes,
             timeout: config.tool_timeout,
-            allow_exec: config.allow_exec,
-            allowed_exec: config.allowed_exec.clone(),
+            allow_exec,
+            allowed_exec,
         };
         let tools = ToolRunner::new(policy);
         let memory = open_memory(&config);
         Self {
-            agent: AgentOrchestrator::new(memory, tools),
+            agent: AgentOrchestrator::new(memory, tools, skills),
             llm: open_llm(&config),
             workspace: config.workspace.clone(),
         }
@@ -367,8 +391,32 @@ impl App {
                         );
                         match channel.admit_message(message) {
                             TelegramAdmission::Accepted(text) => {
-                                let outcome = self.agent.run_task(&text, self.llm.as_mut());
-                                let reply = telegram_user_reply(&outcome.output);
+                                let kind = classify_message_kind(&text);
+                                // Normalize action text: strip polite prefixes so the
+                                // planner receives a clean imperative ("list src" not
+                                // "can you please list src").
+                                let task_text = match kind {
+                                    MessageKind::Action => {
+                                        normalize_action_text(&text).to_owned()
+                                    }
+                                    MessageKind::Knowledge => text.clone(),
+                                };
+                                println!(
+                                    "telegram kind={} task={:?}",
+                                    match kind {
+                                        MessageKind::Action => "action",
+                                        MessageKind::Knowledge => "knowledge",
+                                    },
+                                    task_text
+                                );
+                                let outcome =
+                                    self.agent.run_task(&task_text, self.llm.as_mut());
+                                let reply = match kind {
+                                    MessageKind::Action => telegram_action_reply(&outcome),
+                                    MessageKind::Knowledge => {
+                                        telegram_user_reply(&outcome.output)
+                                    }
+                                };
                                 match send_message(&token, chat_id, &reply) {
                                     Ok(()) => println!("telegram reply sent"),
                                     Err(err) => eprintln!("telegram send failed: {err}"),
@@ -400,6 +448,31 @@ fn pairing_chat_id(text: &str) -> Option<i64> {
     text.lines()
         .find_map(|line| line.strip_prefix("chat_id="))
         .and_then(|raw| raw.parse::<i64>().ok())
+}
+
+fn telegram_action_reply(outcome: &AgentOutcome) -> String {
+    let label = match outcome.status {
+        TaskStatus::Done => "Done",
+        TaskStatus::Failed => "Failed",
+        TaskStatus::Waiting => "Awaiting approval",
+        _ => "In progress",
+    };
+    let body = outcome.output.trim();
+    let mut reply = if body.is_empty() {
+        format!("{label}: (no output)")
+    } else {
+        format!("{label}:\n{body}")
+    };
+    const TELEGRAM_REPLY_LIMIT: usize = 3500;
+    if reply.len() > TELEGRAM_REPLY_LIMIT {
+        let mut end = TELEGRAM_REPLY_LIMIT;
+        while !reply.is_char_boundary(end) {
+            end -= 1;
+        }
+        reply.truncate(end);
+        reply.push_str("\n[truncated]");
+    }
+    reply
 }
 
 fn telegram_user_reply(output: &str) -> String {

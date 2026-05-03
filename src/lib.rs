@@ -6,6 +6,7 @@ pub mod llm;
 pub mod memory;
 pub mod orchestration;
 pub mod planner;
+pub mod skills;
 pub mod tools;
 pub mod types;
 

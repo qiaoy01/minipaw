@@ -1,6 +1,95 @@
 use std::collections::BTreeSet;
 use std::process::Command;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Knowledge,
+    Action,
+}
+
+/// Classify a Telegram message as a knowledge question or an action request.
+///
+/// Action indicators: slash commands, action verbs at the start ("list", "run",
+/// "read <path>"), and indirect phrases ("can you list", "please run").
+/// Everything else is treated as a knowledge question for the LLM to answer.
+pub fn classify_message_kind(text: &str) -> MessageKind {
+    let trimmed = text.trim();
+    // Explicit slash commands (except /help) are always actions.
+    if trimmed.starts_with('/') && !is_help_command(trimmed) {
+        return MessageKind::Action;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // "list" / "ls" — always an action.
+    if lower.starts_with("list ") || lower.starts_with("ls ") || lower == "list" || lower == "ls" {
+        return MessageKind::Action;
+    }
+    // "run" / "exec" — always an action.
+    if lower.starts_with("run ") || lower.starts_with("exec ") || lower.starts_with("execute ") {
+        return MessageKind::Action;
+    }
+    // "read" / "cat" — only if followed by something that looks like a file path.
+    if (lower.starts_with("read ") || lower.starts_with("cat ")) && text_contains_path(&lower) {
+        return MessageKind::Action;
+    }
+    // Indirect imperative phrases.
+    let action_phrases = [
+        "please list",
+        "please run",
+        "please exec",
+        "please read",
+        "can you list",
+        "can you run",
+        "can you read",
+        "could you list",
+        "could you run",
+        "could you read",
+    ];
+    for phrase in &action_phrases {
+        if lower.contains(phrase) {
+            return MessageKind::Action;
+        }
+    }
+    MessageKind::Knowledge
+}
+
+/// Strip common polite prefixes ("can you", "please", etc.) from action text so
+/// the planner receives a clean imperative like "list src" or "run git status".
+pub fn normalize_action_text(text: &str) -> &str {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let prefixes = [
+        "can you please ",
+        "can you ",
+        "could you please ",
+        "could you ",
+        "please ",
+        "would you please ",
+        "would you ",
+    ];
+    for prefix in &prefixes {
+        if lower.starts_with(prefix) {
+            return trimmed[prefix.len()..].trim_start();
+        }
+    }
+    trimmed
+}
+
+fn is_help_command(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower == "/help" || lower.starts_with("/help ")
+}
+
+/// Return true when `text` contains a token that looks like a file/directory
+/// path — has a directory separator or a non-leading dot (file extension).
+fn text_contains_path(text: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        token.contains('/') || token.contains('\\') || {
+            let dot = token.rfind('.');
+            dot.map(|pos| pos > 0 && pos < token.len() - 1).unwrap_or(false)
+        }
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct TelegramConfig {
     pub token: String,
@@ -219,6 +308,63 @@ mod tests {
             }
             _ => panic!("expected pairing instructions"),
         }
+    }
+
+    #[test]
+    fn classifies_knowledge_question() {
+        assert_eq!(
+            classify_message_kind("what time is it?"),
+            MessageKind::Knowledge
+        );
+        assert_eq!(
+            classify_message_kind("how does sqlite work?"),
+            MessageKind::Knowledge
+        );
+        assert_eq!(
+            classify_message_kind("read about sqlite"),
+            MessageKind::Knowledge
+        );
+    }
+
+    #[test]
+    fn classifies_slash_command_as_action() {
+        assert_eq!(classify_message_kind("/ls src"), MessageKind::Action);
+        assert_eq!(classify_message_kind("/read README.md"), MessageKind::Action);
+        assert_eq!(classify_message_kind("/exec git status"), MessageKind::Action);
+        assert_eq!(classify_message_kind("/help"), MessageKind::Knowledge);
+    }
+
+    #[test]
+    fn classifies_natural_language_action() {
+        assert_eq!(classify_message_kind("list src"), MessageKind::Action);
+        assert_eq!(classify_message_kind("ls ."), MessageKind::Action);
+        assert_eq!(classify_message_kind("read src/main.rs"), MessageKind::Action);
+        assert_eq!(classify_message_kind("read README.md"), MessageKind::Action);
+        assert_eq!(classify_message_kind("run git status"), MessageKind::Action);
+    }
+
+    #[test]
+    fn classifies_indirect_action_phrases() {
+        assert_eq!(classify_message_kind("can you list src"), MessageKind::Action);
+        assert_eq!(
+            classify_message_kind("please run git status"),
+            MessageKind::Action
+        );
+        assert_eq!(
+            classify_message_kind("could you read src/main.rs"),
+            MessageKind::Action
+        );
+    }
+
+    #[test]
+    fn normalizes_polite_prefixes() {
+        assert_eq!(normalize_action_text("can you list src"), "list src");
+        assert_eq!(
+            normalize_action_text("please read src/main.rs"),
+            "read src/main.rs"
+        );
+        assert_eq!(normalize_action_text("could you please run git status"), "run git status");
+        assert_eq!(normalize_action_text("list src"), "list src");
     }
 
     #[test]

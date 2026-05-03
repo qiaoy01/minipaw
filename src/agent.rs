@@ -5,6 +5,7 @@ use crate::orchestration::{
     TaskQueue, WorkerAgent,
 };
 use crate::planner::Planner;
+use crate::skills::SkillRegistry;
 use crate::tools::ToolRunner;
 use crate::types::{
     AgentPattern, Heartbeat, Plan, StepStatus, Task, TaskId, TaskStatus, ToolResult, WorkerId,
@@ -26,6 +27,7 @@ pub struct AgentOrchestrator {
     memory: Box<dyn MemoryStore>,
     planner: Planner,
     tools: ToolRunner,
+    skills: SkillRegistry,
     gateway: Gateway,
     queue: TaskQueue,
     workers: Vec<WorkerAgent>,
@@ -33,11 +35,12 @@ pub struct AgentOrchestrator {
 }
 
 impl AgentOrchestrator {
-    pub fn new(memory: Box<dyn MemoryStore>, tools: ToolRunner) -> Self {
+    pub fn new(memory: Box<dyn MemoryStore>, tools: ToolRunner, skills: SkillRegistry) -> Self {
         Self {
             memory,
             planner: Planner,
             tools,
+            skills,
             gateway: Gateway::default(),
             queue: TaskQueue::default(),
             workers: vec![
@@ -256,7 +259,7 @@ impl AgentOrchestrator {
         );
         let mut plan = self
             .planner
-            .plan_with_context(&task, input, pattern, &memory, llm);
+            .plan_with_context(&task, input, pattern, &memory, &self.skills, llm);
         self.execute_plan(task.id, &mut plan, pattern)
     }
 
@@ -350,6 +353,7 @@ mod tests {
                 allow_exec: false,
                 allowed_exec: BTreeSet::new(),
             }),
+            crate::skills::SkillRegistry::default(),
         )
     }
 
