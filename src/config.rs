@@ -84,6 +84,13 @@ impl AgentConfig {
     }
 }
 
+pub fn default_workspace() -> PathBuf {
+    env::var("MINIPAW_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| env::var("HOME").map(|home| PathBuf::from(home).join(".minipaw")))
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
 pub fn read_file_config(workspace: &std::path::Path) -> FileConfig {
     let Some(text) = fs::read_to_string(workspace.join("minipaw.json")).ok() else {
         return FileConfig::default();
@@ -109,6 +116,25 @@ pub fn read_file_config(workspace: &std::path::Path) -> FileConfig {
         primary_agent,
         telegram,
     }
+}
+
+pub fn write_primary_config(
+    workspace: &std::path::Path,
+    provider: &str,
+    url: &str,
+    model: &str,
+) -> std::io::Result<()> {
+    let mut file_config = read_file_config(workspace);
+    file_config.primary_agent = Some(LlmConfig {
+        provider: provider.to_owned(),
+        url: url.to_owned(),
+        model: model.to_owned(),
+    });
+
+    fs::write(
+        workspace.join("minipaw.json"),
+        render_file_config(&file_config),
+    )
 }
 
 pub fn write_telegram_config(

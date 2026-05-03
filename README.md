@@ -24,6 +24,42 @@ cargo build --release
 The release profile enables `lto`, `opt-level = "z"`, `panic = "abort"`, and
 symbol stripping to reduce the final binary size.
 
+## Install
+
+```sh
+./install.sh
+```
+
+The installer uses `$HOME/.minipaw` by default. It builds the release binary,
+copies it to `$HOME/.minipaw/minipaw`, seeds `SOUL.md`, `skills/`,
+`minipaw.json`, `memory/minipaw.sqlite3`, and `workspace/`, adds the install
+directory to `PATH` in `~/.bashrc`, sources that file for the installer process,
+and then runs `minipaw onboarding` to configure the model and channel.
+
+Override the install location with:
+
+```sh
+MINIPAW_HOME=/path/to/minipaw ./install.sh
+```
+
+Uninstall while keeping user data:
+
+```sh
+minipaw uninstall --keep-data
+```
+
+Remove minipaw-managed data as well:
+
+```sh
+minipaw uninstall --remove-user-data
+```
+
+Completely remove the install folder:
+
+```sh
+minipaw uninstall --purge
+```
+
 ## Run
 
 ```sh
@@ -40,6 +76,10 @@ minipaw task list                   list tasks for this process
 minipaw task show <id>              inspect a task
 minipaw memory get <key>            read a fact
 minipaw memory set <key> <value>    write a fact
+minipaw gateway run                 run foreground gateway
+minipaw gateway simulate            wait for simulated channel/agent messages
+minipaw onboarding                  configure model and channel
+minipaw uninstall                   remove minipaw install
 minipaw config check                validate config
 minipaw config telegram set --token <token> --chats <ids>
 minipaw config telegram pair <chat-id>
@@ -86,14 +126,55 @@ Implemented modules:
 - `channels`: Telegram admission boundary that validates allowlisted chat IDs.
 - `cli`: dependency-free management CLI with manual argument parsing.
 
+OpenClaw comparison:
+
+- OpenClaw has a full gateway server with WebSocket sessions, channel plugins,
+  session subscriptions, session-message broadcasts, delivery contexts, and
+  inter-session agent-message provenance.
+- minipaw keeps the same rough boundary in a smaller form: Telegram admission
+  validates paired chats, the orchestration gateway routes local work, and
+  `gateway simulate` reads channel/agent events from stdin and emits
+  `session.message`-style log events.
+- This repo does not currently include a `sea/hermes-agent` checkout to compare
+  directly.
+
+Simulated gateway:
+
+```sh
+minipaw gateway run
+minipaw gateway simulate
+```
+
+`gateway run` reads `minipaw.json` from the default workspace
+(`MINIPAW_WORKSPACE`, then `MINIPAW_HOME`, then `$HOME/.minipaw`) and runs in
+the foreground. It polls Telegram when `telegram.bot_token` is configured and
+also reads stdin gateway events unless `--no-stdin` is set. It does not install
+or manage a background service.
+
+Input format:
+
+```text
+telegram <chat-id> <message>
+agent <session-key> <message>
+/quit
+```
+
+Example:
+
+```sh
+printf 'telegram 123456 hello\nagent agent:main:telegram:chat:123456 follow up\n' | minipaw gateway simulate
+```
+
 Environment configuration:
 
 ```text
+MINIPAW_HOME=$HOME/.minipaw
+MINIPAW_WORKSPACE=$MINIPAW_HOME
 MINIPAW_ALLOW_EXEC=1
 MINIPAW_EXEC_ALLOWLIST=git,ls,uname
 MINIPAW_TELEGRAM_TOKEN=<bot-token>
 MINIPAW_TELEGRAM_CHATS=123456,789012
-MINIPAW_SQLITE_PATH=/var/lib/minipaw/minipaw.sqlite3
+MINIPAW_SQLITE_PATH=$MINIPAW_HOME/memory/minipaw.sqlite3
 ```
 
 Telegram bot configuration:

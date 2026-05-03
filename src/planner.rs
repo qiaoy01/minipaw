@@ -1,6 +1,6 @@
 use crate::llm::LlmClient;
 use crate::memory::ProgressiveMemory;
-use crate::skills::SkillRegistry;
+use crate::skills::{Skill, SkillRegistry};
 use crate::types::{AgentPattern, Plan, PlanStep, PlanStepKind, StepStatus, Task};
 
 #[derive(Debug, Default, Clone)]
@@ -69,7 +69,7 @@ impl Planner {
             let prompt = planner_prompt(pattern, text, memory, skills);
             let response = llm.next_step(&prompt);
             // Let the LLM invoke a skill or fall back to a plain answer.
-            parse_skill_call(&response, skills).unwrap_or(PlanStepKind::Answer(response))
+            parse_skill_call(text, &response, skills).unwrap_or(PlanStepKind::Answer(response))
         });
 
         Plan {
@@ -87,7 +87,7 @@ impl Planner {
 /// response.  On a match, look up the skill's exec command and return the
 /// corresponding plan step.  Returns `None` when no directive is present or
 /// the named skill has no exec command.
-fn parse_skill_call(response: &str, registry: &SkillRegistry) -> Option<PlanStepKind> {
+fn parse_skill_call(input: &str, response: &str, registry: &SkillRegistry) -> Option<PlanStepKind> {
     for line in response.lines().take(4) {
         let trimmed = line.trim();
         if !trimmed.to_ascii_lowercase().starts_with("skill:") {
@@ -95,6 +95,9 @@ fn parse_skill_call(response: &str, registry: &SkillRegistry) -> Option<PlanStep
         }
         let name = trimmed["skill:".len()..].trim();
         let skill = registry.find(name)?;
+        if !skill_allowed_for_input(input, skill) {
+            return None;
+        }
         let exec = skill.exec.as_deref()?;
         let mut parts = exec.split_whitespace();
         let program = parts.next()?.to_owned();
@@ -102,6 +105,28 @@ fn parse_skill_call(response: &str, registry: &SkillRegistry) -> Option<PlanStep
         return Some(PlanStepKind::Exec { program, args });
     }
     None
+}
+
+fn skill_allowed_for_input(input: &str, skill: &Skill) -> bool {
+    let input_terms = meaningful_terms(input);
+    if input_terms.is_empty() {
+        return false;
+    }
+    let mut skill_text = String::new();
+    skill_text.push_str(&skill.name);
+    skill_text.push(' ');
+    skill_text.push_str(&skill.description);
+    let skill_terms = meaningful_terms(&skill_text);
+    input_terms.iter().any(|term| skill_terms.contains(term))
+}
+
+fn meaningful_terms(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|term| term.len() >= 3)
+        .filter(|term| !is_stop_word(term))
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 fn pattern_selection_prompt(input: &str, memory: &ProgressiveMemory) -> String {
@@ -401,6 +426,10 @@ pub fn help_text() -> String {
         "task list                   list tasks",
         "memory get <key>            read memory",
         "memory set <key> <value>    write memory",
+        "gateway run                 run foreground gateway",
+        "gateway simulate            wait for simulated channel/agent messages",
+        "onboarding                  configure model and channel",
+        "uninstall                   remove minipaw install",
         "config check                validate config",
         "config telegram set ...     configure Telegram bot",
         "config telegram pair <id>   allow one Telegram chat",
@@ -505,5 +534,17 @@ mod tests {
             ),
             AgentPattern::HubAndSpoke
         );
+    }
+
+    #[test]
+    fn gates_skill_calls_by_generic_term_overlap() {
+        let skill = Skill {
+            name: "current-time".into(),
+            description: "Get the current date and time on the local machine".into(),
+            exec: Some("date".into()),
+        };
+
+        assert!(!skill_allowed_for_input("add 7 again", &skill));
+        assert!(skill_allowed_for_input("what time is it", &skill));
     }
 }

@@ -570,6 +570,79 @@ pub mod sqlite {
             unsafe { sqlite3_finalize(stmt) };
             value
         }
+
+        fn query_message_index_rows(&self) -> Vec<(u64, u64, String, String)> {
+            let sql = "SELECT id, task_id, role, body FROM messages ORDER BY id DESC LIMIT 64";
+            let Ok(sql) = CString::new(sql) else {
+                return Vec::new();
+            };
+            let mut stmt = ptr::null_mut();
+            let rc = unsafe {
+                sqlite3_prepare_v2(self.db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut())
+            };
+            if rc != SQLITE_OK {
+                return Vec::new();
+            }
+            let mut rows = Vec::new();
+            while unsafe { sqlite3_step(stmt) } == SQLITE_ROW {
+                rows.push((
+                    unsafe { sqlite3_column_int64(stmt, 0) as u64 },
+                    unsafe { sqlite3_column_int64(stmt, 1) as u64 },
+                    column_text(stmt, 2).unwrap_or_default(),
+                    column_text(stmt, 3).unwrap_or_default(),
+                ));
+            }
+            unsafe { sqlite3_finalize(stmt) };
+            rows
+        }
+
+        fn query_tool_index_rows(&self) -> Vec<(u64, u64, String, String)> {
+            let sql = "SELECT id, task_id, tool, output FROM tool_runs ORDER BY id DESC LIMIT 64";
+            let Ok(sql) = CString::new(sql) else {
+                return Vec::new();
+            };
+            let mut stmt = ptr::null_mut();
+            let rc = unsafe {
+                sqlite3_prepare_v2(self.db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut())
+            };
+            if rc != SQLITE_OK {
+                return Vec::new();
+            }
+            let mut rows = Vec::new();
+            while unsafe { sqlite3_step(stmt) } == SQLITE_ROW {
+                rows.push((
+                    unsafe { sqlite3_column_int64(stmt, 0) as u64 },
+                    unsafe { sqlite3_column_int64(stmt, 1) as u64 },
+                    column_text(stmt, 2).unwrap_or_default(),
+                    column_text(stmt, 3).unwrap_or_default(),
+                ));
+            }
+            unsafe { sqlite3_finalize(stmt) };
+            rows
+        }
+
+        fn query_fact_index_rows(&self) -> Vec<(String, String)> {
+            let sql = "SELECT key, value FROM facts ORDER BY updated_at DESC LIMIT 64";
+            let Ok(sql) = CString::new(sql) else {
+                return Vec::new();
+            };
+            let mut stmt = ptr::null_mut();
+            let rc = unsafe {
+                sqlite3_prepare_v2(self.db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut())
+            };
+            if rc != SQLITE_OK {
+                return Vec::new();
+            }
+            let mut rows = Vec::new();
+            while unsafe { sqlite3_step(stmt) } == SQLITE_ROW {
+                rows.push((
+                    column_text(stmt, 0).unwrap_or_default(),
+                    column_text(stmt, 1).unwrap_or_default(),
+                ));
+            }
+            unsafe { sqlite3_finalize(stmt) };
+            rows
+        }
     }
 
     impl MemoryStore for SqliteStore {
@@ -671,6 +744,39 @@ pub mod sqlite {
                 });
             }
 
+            for (id, task_id, role, body) in self.query_message_index_rows() {
+                entries.push(MemoryIndexEntry {
+                    id: format!("msg:{task_id}:{id}"),
+                    task_id: Some(TaskId(task_id)),
+                    kind: format!("message/{role}"),
+                    summary: cap_chars(&body, 160),
+                    bytes: body.len(),
+                    score: relevance(query, &body),
+                });
+            }
+
+            for (id, task_id, tool, output) in self.query_tool_index_rows() {
+                entries.push(MemoryIndexEntry {
+                    id: format!("tool:{task_id}:{id}"),
+                    task_id: Some(TaskId(task_id)),
+                    kind: format!("tool/{tool}"),
+                    summary: cap_chars(&output, 160),
+                    bytes: output.len(),
+                    score: relevance(query, &output),
+                });
+            }
+
+            for (key, value) in self.query_fact_index_rows() {
+                entries.push(MemoryIndexEntry {
+                    id: format!("fact:{key}"),
+                    task_id: None,
+                    kind: "fact".to_owned(),
+                    summary: cap_chars(&format!("{key}={value}"), 160),
+                    bytes: value.len(),
+                    score: relevance(query, &format!("{key} {value}")),
+                });
+            }
+
             entries.sort_by(|left, right| {
                 right
                     .score
@@ -682,18 +788,53 @@ pub mod sqlite {
         }
 
         fn memory_detail(&self, id: &str, max_bytes: usize) -> Option<MemoryDetail> {
-            let raw = id.strip_prefix("task:")?;
-            let task = self.get_task(TaskId(raw.parse::<u64>().ok()?))?;
-            Some(MemoryDetail {
-                id: id.to_owned(),
-                body: cap_bytes(
-                    &format!(
-                        "task={} status={} created={} updated={} title={}",
-                        task.id, task.status, task.created_at, task.updated_at, task.title
+            if let Some(raw) = id.strip_prefix("task:") {
+                let task = self.get_task(TaskId(raw.parse::<u64>().ok()?))?;
+                return Some(MemoryDetail {
+                    id: id.to_owned(),
+                    body: cap_bytes(
+                        &format!(
+                            "task={} status={} created={} updated={} title={}",
+                            task.id, task.status, task.created_at, task.updated_at, task.title
+                        ),
+                        max_bytes,
                     ),
-                    max_bytes,
-                ),
-            })
+                });
+            }
+
+            if let Some(rest) = id.strip_prefix("msg:") {
+                let (_, raw_id) = rest.split_once(':')?;
+                let body = self.query_text(&format!(
+                    "SELECT 't' || task_id || ' ' || role || ': ' || body FROM messages WHERE id={} LIMIT 1",
+                    raw_id.parse::<i64>().ok()?
+                ))?;
+                return Some(MemoryDetail {
+                    id: id.to_owned(),
+                    body: cap_bytes(&body, max_bytes),
+                });
+            }
+
+            if let Some(rest) = id.strip_prefix("tool:") {
+                let (_, raw_id) = rest.split_once(':')?;
+                let body = self.query_text(&format!(
+                    "SELECT 't' || task_id || ' ' || tool || ' ok=' || ok || ': ' || output FROM tool_runs WHERE id={} LIMIT 1",
+                    raw_id.parse::<i64>().ok()?
+                ))?;
+                return Some(MemoryDetail {
+                    id: id.to_owned(),
+                    body: cap_bytes(&body, max_bytes),
+                });
+            }
+
+            if let Some(key) = id.strip_prefix("fact:") {
+                let value = self.get_fact(key)?;
+                return Some(MemoryDetail {
+                    id: id.to_owned(),
+                    body: cap_bytes(&format!("{key}={value}"), max_bytes),
+                });
+            }
+
+            None
         }
     }
 
