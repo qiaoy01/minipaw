@@ -421,9 +421,12 @@ pub fn classify_message(context: &str, llm: &mut dyn LlmClient) -> MessageClass 
     let prompt = format!(
         "Classify the intent of this message into exactly one category.\n\
          Categories:\n\
-         minihow - the user wants to execute something, perform an action, or get something done\n\
+         minihow - the user wants to execute something, perform an action, compute a result, \
+         do arithmetic or math, read/write files, run a command, or get something done\n\
          miniwhy - the user wants to understand, analyze, or reason about information\n\
-         miniwhat - the user wants to query or retrieve specific information\n\
+         miniwhat - the user wants to query or retrieve a known fact, definition, or stored information \
+         (no computation needed)\n\
+         When in doubt between minihow and miniwhat, choose minihow.\n\
          Reply with only the category name.\n\
          Message:\n{context}"
     );

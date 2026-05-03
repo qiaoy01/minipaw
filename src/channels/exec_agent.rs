@@ -31,14 +31,14 @@ impl AgentHandler for ExecAgent {
 }
 
 fn parse_exec_command(command: &str) -> PlanStepKind {
-    let trimmed = command.trim();
-    let mut parts = trimmed.split_whitespace();
-    let Some(verb) = parts.next() else {
+    let parts = shell_split(command.trim());
+    let mut iter = parts.iter().map(String::as_str);
+    let Some(verb) = iter.next() else {
         return PlanStepKind::Answer("(empty command)".to_owned());
     };
     match verb {
         "read" | "cat" => {
-            let path = parts.collect::<Vec<_>>().join(" ");
+            let path = iter.collect::<Vec<_>>().join(" ");
             if path.is_empty() {
                 PlanStepKind::Answer("read requires a path".to_owned())
             } else {
@@ -46,7 +46,7 @@ fn parse_exec_command(command: &str) -> PlanStepKind {
             }
         }
         "ls" | "list" => {
-            let path = parts.collect::<Vec<_>>().join(" ");
+            let path = iter.collect::<Vec<_>>().join(" ");
             PlanStepKind::ListDir(if path.is_empty() {
                 ".".to_owned()
             } else {
@@ -55,8 +55,52 @@ fn parse_exec_command(command: &str) -> PlanStepKind {
         }
         _ => {
             let program = verb.to_owned();
-            let args = parts.map(str::to_owned).collect();
+            let args = iter.map(str::to_owned).collect();
             PlanStepKind::Exec { program, args }
         }
     }
+}
+
+/// Split a command string into tokens respecting single and double quotes.
+fn shell_split(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(next) = chars.next() {
+                                current.push(next);
+                            }
+                        }
+                        _ => current.push(c),
+                    }
+                }
+            }
+            '\'' => {
+                while let Some(c) = chars.next() {
+                    if c == '\'' {
+                        break;
+                    }
+                    current.push(c);
+                }
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }

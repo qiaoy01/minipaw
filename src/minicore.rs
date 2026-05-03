@@ -28,9 +28,10 @@ pub struct SessionReport {
 pub struct MiniCore {
     pub(crate) memory: Box<dyn MemoryStore>,
     pub(crate) llm: Box<dyn LlmClient>,
-    _tools: ToolRunner,
+    tools: ToolRunner,
     _skills: SkillRegistry,
     agents: Vec<Box<dyn AgentHandler>>,
+    os_info: String,
 }
 
 impl MiniCore {
@@ -43,7 +44,8 @@ impl MiniCore {
         Self {
             memory,
             llm,
-            _tools: tools,
+            os_info: detect_os_info(),
+            tools,
             _skills: skills,
             agents: Vec::new(),
         }
@@ -71,34 +73,53 @@ impl MiniCore {
     }
 
     pub fn process(&mut self, msg: IncomingMessage) -> SessionReport {
+        if msg.text.trim() == "/new" {
+            if let Some(ref cid) = msg.context_id {
+                self.memory.delete_fact(&format!("ctx:{cid}"));
+            }
+            let task = self.memory.create_task("/new");
+            self.memory.append_message(task.id, "user", "/new");
+            self.memory
+                .append_message(task.id, "assistant", "New conversation started.");
+            self.memory.update_task_status(task.id, TaskStatus::Done);
+            return SessionReport {
+                task_id: task.id,
+                class: MessageClass::MiniHow,
+                output: "New conversation started.".to_owned(),
+                steps: 0,
+            };
+        }
+
         let (prior_task_id, context) = self.assemble_context(&msg);
 
         let class = classify_message(&context, self.llm.as_mut());
 
-        let task = self.memory.create_task(&msg.text);
-        self.memory.append_message(task.id, "user", &msg.text);
-
-        // Bind context_id → task_id for first message in a session;
-        // subsequent messages with the same context_id will find this mapping.
-        if let Some(ref cid) = msg.context_id {
-            if prior_task_id.is_none() {
+        // Reuse the existing session task so all turns accumulate in one place;
+        // create a new task only on the first message in a session.
+        let task_id = if let Some(tid) = prior_task_id {
+            tid
+        } else {
+            let task = self.memory.create_task(&msg.text);
+            if let Some(ref cid) = msg.context_id {
                 self.memory
                     .set_fact(&format!("ctx:{cid}"), &task.id.0.to_string());
             }
-        }
+            task.id
+        };
 
-        self.memory.update_task_status(task.id, TaskStatus::Running);
-        let (output, steps) = self.run_session(task.id, &msg.text, &context, class);
+        self.memory.append_message(task_id, "user", &msg.text);
+        self.memory.update_task_status(task_id, TaskStatus::Running);
+        let (output, steps) = self.run_session(task_id, &msg.text, &context, class);
         let final_status = if output.starts_with("error:") {
             TaskStatus::Failed
         } else {
             TaskStatus::Done
         };
-        self.memory.update_task_status(task.id, final_status);
-        self.memory.append_message(task.id, "assistant", &output);
+        self.memory.update_task_status(task_id, final_status);
+        self.memory.append_message(task_id, "assistant", &output);
 
         SessionReport {
-            task_id: task.id,
+            task_id,
             class,
             output,
             steps,
@@ -149,18 +170,36 @@ impl MiniCore {
     fn run_minihow(&mut self, task_id: TaskId, input: &str, context: &str) -> (String, usize) {
         let mut accumulated = context.to_owned();
         let mut steps = 0;
+        let mut last_exec: Option<String> = None;
+        let mut last_result: Option<String> = None;
 
         for _ in 0..MAX_SESSION_STEPS {
             steps += 1;
-            let agent_names: Vec<&str> = self.agents.iter().map(|a| a.name()).collect();
+            let workspace = self.tools.policy().workspace.display().to_string();
             let prompt = format!(
-                "You are an execution advisor. Registered agents: {}.\n\
+                "You are an execution advisor.\n\
+                 OS: {}\n\
+                 Workspace: {workspace}\n\
+                 IMPORTANT RULES:\n\
+                 1. NEVER compute arithmetic, logic, or any calculation yourself. \
+                 Always delegate to a tool — use python3 -c for any math, no matter \
+                 how simple (e.g. EXEC: python3 -c \"print(3+1)\").\n\
+                 2. Use EXEC for all I/O: reading files, listing directories, \
+                 network calls, running programs.\n\
+                 3. Built-in commands always available without allowlisting: \
+                 read <path>, ls [path].\n\
+                 4. If a command returns \"exec denied\", try an alternative tool. \
+                 Only give up if no alternative exists.\n\
+                 5. Once the result you need already appears in the Context from a \
+                 previous EXEC step, do NOT run that command again — issue DONE \
+                 immediately with that result.\n\
+                 6. When all needed data is in Context, respond with DONE.\n\
                  Goal: {input}\nContext:\n{accumulated}\n\n\
                  Respond with exactly one directive on the first line:\n\
-                 EXEC: <command>          — run via exec agent\n\
-                 EXEC: telegram:<id>:<msg> — send via telegram agent\n\
-                 DONE: <final report>     — task complete",
-                agent_names.join(", ")
+                 EXEC: <shell command and args>  — run a shell command or calculation\n\
+                 EXEC: telegram:<id>:<msg>       — send a telegram message\n\
+                 DONE: <final answer>            — all done, report result to user",
+                self.os_info
             );
             let response = self.llm.next_step(&prompt);
             let first_line = response.lines().next().unwrap_or("").trim();
@@ -173,10 +212,25 @@ impl MiniCore {
 
             if let Some(cmd) = first_line.strip_prefix("EXEC:") {
                 let cmd = cmd.trim();
+
+                // Loop detection: same command repeated — use last result as final answer.
+                if last_exec.as_deref() == Some(cmd) {
+                    if let Some(result) = last_result {
+                        let output = result.trim().to_owned();
+                        self.memory.append_message(task_id, "advisor", &output);
+                        return (output, steps);
+                    }
+                }
+
                 let result = self.dispatch_exec(cmd);
+                println!("minihow step={steps} exec={cmd:?} ok={} out={:?}",
+                    !result.starts_with("error:"),
+                    &result[..result.len().min(120)]);
                 let record = format!("EXEC: {cmd}\nResult: {result}");
                 self.memory.append_message(task_id, "exec", &record);
                 accumulated.push_str(&format!("\n{record}"));
+                last_exec = Some(cmd.to_owned());
+                last_result = Some(result);
                 continue;
             }
 
@@ -246,11 +300,14 @@ impl MiniCore {
 
     fn dispatch_exec(&self, command: &str) -> String {
         // "agent_name:rest" routes to a specific agent; bare command defaults to exec.
+        // Only treat as agent routing when the prefix is a single word (no spaces)
+        // so that colons inside shell commands (e.g. python3 -c "x = 1: ...") are ignored.
         if let Some((name, rest)) = command.split_once(':') {
             let name = name.trim();
-            // Exclude numeric prefixes (e.g. Telegram chat IDs like "12345:message")
-            // to avoid misrouting those to a non-existent "12345" agent.
-            if !name.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            let is_agent_name = !name.is_empty()
+                && !name.contains(' ')
+                && !name.chars().all(|c| c.is_ascii_digit() || c == '-');
+            if is_agent_name {
                 for agent in &self.agents {
                     if agent.name() == name {
                         return match agent.execute(rest.trim()) {
@@ -272,4 +329,36 @@ impl MiniCore {
         }
         "error: no exec agent registered".to_owned()
     }
+}
+
+fn detect_os_info() -> String {
+    if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+        let pretty = content
+            .lines()
+            .find(|l| l.starts_with("PRETTY_NAME="))
+            .and_then(|l| l.strip_prefix("PRETTY_NAME="))
+            .map(|v| v.trim_matches('"'));
+        let id = content
+            .lines()
+            .find(|l| l.starts_with("ID="))
+            .and_then(|l| l.strip_prefix("ID="))
+            .map(|v| v.trim_matches('"'));
+        if let Some(name) = pretty {
+            let pkg = match id.unwrap_or("") {
+                "debian" | "ubuntu" | "raspbian" => "apt",
+                "fedora" | "rhel" | "centos" => "dnf/yum",
+                "arch" => "pacman",
+                "alpine" => "apk",
+                _ => "the system package manager",
+            };
+            return format!("{name} (package manager: {pkg})");
+        }
+    }
+    // Fallback: uname
+    if let Ok(out) = std::process::Command::new("uname").args(["-s", "-r", "-m"]).output() {
+        if let Ok(s) = std::str::from_utf8(&out.stdout) {
+            return s.trim().to_owned();
+        }
+    }
+    "Unix".to_owned()
 }

@@ -23,6 +23,7 @@ pub struct LlmConfig {
     pub provider: String,
     pub url: String,
     pub model: String,
+    pub thinking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +46,7 @@ impl AgentConfig {
             max_file_bytes: 16 * 1024,
             max_tool_output_bytes: 24 * 1024,
             tool_timeout: Duration::from_secs(10),
-            allow_exec: false,
+            allow_exec: true,
             allowed_exec: BTreeSet::new(),
             telegram_token: None,
             telegram_allowed_chats: BTreeSet::new(),
@@ -56,7 +57,9 @@ impl AgentConfig {
     pub fn from_env(workspace: PathBuf) -> Self {
         let mut config = Self::constrained(workspace);
         let file_config = read_file_config(&config.workspace);
-        config.allow_exec = env_bool("MINIPAW_ALLOW_EXEC");
+        if env::var("MINIPAW_ALLOW_EXEC").is_ok() {
+            config.allow_exec = env_bool("MINIPAW_ALLOW_EXEC");
+        }
         config.allowed_exec = env_list("MINIPAW_EXEC_ALLOWLIST").into_iter().collect();
         config.telegram_token = env::var("MINIPAW_TELEGRAM_TOKEN").ok().or_else(|| {
             file_config
@@ -101,6 +104,7 @@ pub fn read_file_config(workspace: &std::path::Path) -> FileConfig {
             provider: extract_json_string(primary, "provider")?,
             url: extract_json_string(primary, "url")?,
             model: extract_json_string(primary, "model")?,
+            thinking: extract_json_bool(primary, "thinking").unwrap_or(false),
         })
     });
 
@@ -125,10 +129,12 @@ pub fn write_primary_config(
     model: &str,
 ) -> std::io::Result<()> {
     let mut file_config = read_file_config(workspace);
+    let thinking = file_config.primary_agent.as_ref().map(|c| c.thinking).unwrap_or(false);
     file_config.primary_agent = Some(LlmConfig {
         provider: provider.to_owned(),
         url: url.to_owned(),
         model: model.to_owned(),
+        thinking,
     });
 
     fs::write(
@@ -241,6 +247,9 @@ fn env_llm_config() -> Option<LlmConfig> {
         provider: env::var("MINIPAW_LLM_PROVIDER").ok()?,
         url: env::var("MINIPAW_LLM_URL").ok()?,
         model: env::var("MINIPAW_LLM_MODEL").ok()?,
+        thinking: env::var("MINIPAW_LLM_THINKING").is_ok_and(|v| {
+            matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
+        }),
     })
 }
 
@@ -278,6 +287,20 @@ fn extract_object<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+fn extract_json_bool(text: &str, key: &str) -> Option<bool> {
+    let marker = format!("\"{key}\"");
+    let key_pos = text.find(&marker)?;
+    let after = text[key_pos + marker.len()..].trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    if after.starts_with("true") {
+        Some(true)
+    } else if after.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn extract_json_string(text: &str, key: &str) -> Option<String> {
@@ -405,6 +428,7 @@ mod tests {
                 provider: "llamacpp".into(),
                 url: "http://host/v1".into(),
                 model: "qwen9b".into(),
+                thinking: false,
             }),
             telegram: Some(TelegramBotConfig {
                 token: "123:abc".into(),

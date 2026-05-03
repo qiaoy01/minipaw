@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
@@ -63,11 +64,11 @@ impl App {
         }
 
         let mut allow_exec = config.allow_exec;
-        let mut allowed_exec = config.allowed_exec.clone();
+        let mut skill_exec = BTreeSet::new();
         if !skills.is_empty() {
             allow_exec = true;
             for prog in skills.exec_programs() {
-                allowed_exec.insert(prog.to_owned());
+                skill_exec.insert(prog.to_owned());
             }
         }
 
@@ -77,7 +78,8 @@ impl App {
             max_output_bytes: config.max_tool_output_bytes,
             timeout: config.tool_timeout,
             allow_exec,
-            allowed_exec,
+            allowed_exec: config.allowed_exec.clone(),
+            skill_exec,
         };
 
         let tools = ToolRunner::new(policy.clone());

@@ -57,6 +57,7 @@ pub trait MemoryStore {
     fn append_tool_result(&mut self, task_id: TaskId, result: &ToolResult);
     fn set_fact(&mut self, key: &str, value: &str);
     fn get_fact(&self, key: &str) -> Option<String>;
+    fn delete_fact(&mut self, key: &str);
     fn memory_index(&self, query: &str, limit: usize) -> Vec<MemoryIndexEntry>;
     fn memory_detail(&self, id: &str, max_bytes: usize) -> Option<MemoryDetail>;
     fn task_context(&self, task_id: TaskId, max_bytes: usize) -> String;
@@ -197,6 +198,10 @@ impl MemoryStore for InMemoryStore {
 
     fn get_fact(&self, key: &str) -> Option<String> {
         self.facts.get(key).cloned()
+    }
+
+    fn delete_fact(&mut self, key: &str) {
+        self.facts.remove(key);
     }
 
     fn memory_index(&self, query: &str, limit: usize) -> Vec<MemoryIndexEntry> {
@@ -740,6 +745,13 @@ pub mod sqlite {
                 "SELECT value FROM facts WHERE key={} LIMIT 1",
                 sql_quote(key)
             ))
+        }
+
+        fn delete_fact(&mut self, key: &str) {
+            let _ = self.exec(&format!(
+                "DELETE FROM facts WHERE key={};",
+                sql_quote(key)
+            ));
         }
 
         fn memory_index(&self, query: &str, limit: usize) -> Vec<MemoryIndexEntry> {

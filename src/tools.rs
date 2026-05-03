@@ -15,12 +15,21 @@ pub struct ToolPolicy {
     pub max_output_bytes: usize,
     pub timeout: Duration,
     pub allow_exec: bool,
+    /// Explicit user allowlist. Empty means allow all (when allow_exec=true).
     pub allowed_exec: BTreeSet<String>,
+    /// Programs added by skills — always allowed, never affect the "empty=all" logic.
+    pub skill_exec: BTreeSet<String>,
 }
 
 impl ToolPolicy {
     pub fn allows_program(&self, program: &str) -> bool {
-        self.allow_exec && self.allowed_exec.contains(program)
+        if !self.allow_exec {
+            return false;
+        }
+        if self.skill_exec.contains(program) {
+            return true;
+        }
+        self.allowed_exec.is_empty() || self.allowed_exec.contains(program)
     }
 }
 
@@ -32,6 +41,10 @@ pub struct ToolRunner {
 impl ToolRunner {
     pub fn new(policy: ToolPolicy) -> Self {
         Self { policy }
+    }
+
+    pub fn policy(&self) -> &ToolPolicy {
+        &self.policy
     }
 
     pub fn run_step(&self, step: &PlanStepKind) -> ToolResult {
