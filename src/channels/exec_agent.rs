@@ -75,7 +75,12 @@ fn shell_split(s: &str) -> Vec<String> {
                         '"' => break,
                         '\\' => {
                             if let Some(next) = chars.next() {
-                                current.push(next);
+                                match next {
+                                    'n' => current.push('\n'),
+                                    't' => current.push('\t'),
+                                    'r' => current.push('\r'),
+                                    other => current.push(other),
+                                }
                             }
                         }
                         _ => current.push(c),
@@ -84,10 +89,20 @@ fn shell_split(s: &str) -> Vec<String> {
             }
             '\'' => {
                 while let Some(c) = chars.next() {
-                    if c == '\'' {
-                        break;
+                    match c {
+                        '\'' => break,
+                        '\\' => {
+                            if let Some(next) = chars.next() {
+                                match next {
+                                    'n' => current.push('\n'),
+                                    't' => current.push('\t'),
+                                    'r' => current.push('\r'),
+                                    other => current.push(other),
+                                }
+                            }
+                        }
+                        _ => current.push(c),
                     }
-                    current.push(c);
                 }
             }
             c if c.is_whitespace() => {
