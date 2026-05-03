@@ -59,6 +59,7 @@ pub trait MemoryStore {
     fn get_fact(&self, key: &str) -> Option<String>;
     fn memory_index(&self, query: &str, limit: usize) -> Vec<MemoryIndexEntry>;
     fn memory_detail(&self, id: &str, max_bytes: usize) -> Option<MemoryDetail>;
+    fn task_context(&self, task_id: TaskId, max_bytes: usize) -> String;
 
     fn progressive_memory(
         &self,
@@ -253,6 +254,16 @@ impl MemoryStore for InMemoryStore {
         });
         entries.truncate(limit);
         entries
+    }
+
+    fn task_context(&self, task_id: TaskId, max_bytes: usize) -> String {
+        let parts: Vec<String> = self
+            .messages
+            .iter()
+            .filter(|m| m.task_id == task_id)
+            .map(|m| format!("{}: {}", m.role, m.body))
+            .collect();
+        cap_bytes(&parts.join("\n"), max_bytes)
     }
 
     fn memory_detail(&self, id: &str, max_bytes: usize) -> Option<MemoryDetail> {
@@ -694,6 +705,46 @@ pub mod sqlite {
                     max_bytes,
                 ),
             })
+        }
+
+        fn task_context(&self, task_id: TaskId, max_bytes: usize) -> String {
+            let rows = self.query_message_rows(task_id);
+            let text = rows
+                .into_iter()
+                .map(|(role, body)| format!("{role}: {body}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            cap_bytes(&text, max_bytes)
+        }
+    }
+
+    impl SqliteStore {
+        fn query_message_rows(&self, task_id: TaskId) -> Vec<(String, String)> {
+            let sql = format!(
+                "SELECT role, body FROM messages WHERE task_id={} ORDER BY id ASC",
+                task_id.0
+            );
+            let Ok(cstring) = CString::new(sql) else {
+                return Vec::new();
+            };
+            let mut stmt = ptr::null_mut();
+            let rc = unsafe {
+                sqlite3_prepare_v2(self.db, cstring.as_ptr(), -1, &mut stmt, ptr::null_mut())
+            };
+            if rc != SQLITE_OK {
+                return Vec::new();
+            }
+            let mut rows = Vec::new();
+            loop {
+                if unsafe { sqlite3_step(stmt) } != SQLITE_ROW {
+                    break;
+                }
+                let role = column_text(stmt, 0).unwrap_or_default();
+                let body = column_text(stmt, 1).unwrap_or_default();
+                rows.push((role, body));
+            }
+            unsafe { sqlite3_finalize(stmt) };
+            rows
         }
     }
 

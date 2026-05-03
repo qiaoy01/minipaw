@@ -1,21 +1,20 @@
 use std::env;
 use std::io::{self, BufRead, Write};
 
-use crate::agent::{AgentOrchestrator, AgentOutcome};
+use crate::channels::exec_agent::ExecAgent;
 use crate::channels::telegram::{
-    classify_message_kind, get_updates, normalize_action_text, send_message, MessageKind,
-    TelegramAdmission, TelegramChannel, TelegramConfig,
+    get_updates, send_message, TelegramAdmission, TelegramChannel, TelegramConfig,
 };
+use crate::channels::telegram_agent::TelegramAgent;
 use crate::config::{
     pair_telegram_chat, read_file_config, unpair_telegram_chat, write_telegram_config, AgentConfig,
 };
 use crate::llm::{LlamaCppClient, LlmClient, OfflineLlm};
 use crate::memory::{InMemoryStore, MemoryStore};
-use crate::orchestration::PipelineStage;
+use crate::minicore::{IncomingMessage, MiniCore, SessionReport};
 use crate::planner::help_text;
 use crate::skills::SkillRegistry;
 use crate::tools::{ToolPolicy, ToolRunner};
-use crate::types::{TaskId, TaskStatus};
 
 pub fn run_from_env() -> io::Result<i32> {
     let workspace = env::current_dir()?;
@@ -26,8 +25,7 @@ pub fn run_from_env() -> io::Result<i32> {
 }
 
 struct App {
-    agent: AgentOrchestrator,
-    llm: Box<dyn LlmClient>,
+    core: MiniCore,
     workspace: std::path::PathBuf,
 }
 
@@ -45,8 +43,7 @@ impl App {
                     .join(", ")
             );
         }
-        // Skills are operator-curated; auto-trust their exec programs so they
-        // don't require MINIPAW_ALLOW_EXEC in the environment.
+
         let mut allow_exec = config.allow_exec;
         let mut allowed_exec = config.allowed_exec.clone();
         if !skills.is_empty() {
@@ -55,6 +52,7 @@ impl App {
                 allowed_exec.insert(prog.to_owned());
             }
         }
+
         let policy = ToolPolicy {
             workspace: config.workspace.clone(),
             max_file_bytes: config.max_file_bytes,
@@ -63,11 +61,26 @@ impl App {
             allow_exec,
             allowed_exec,
         };
-        let tools = ToolRunner::new(policy);
+
+        let tools = ToolRunner::new(policy.clone());
         let memory = open_memory(&config);
+        let llm = open_llm(&config);
+
+        let mut core = MiniCore::new(memory, llm, tools, skills);
+
+        // Register built-in agents.
+        core.register(Box::new(ExecAgent::new(policy)));
+        if let Some(ref token) = config.telegram_token {
+            core.register(Box::new(TelegramAgent::new(token.clone())));
+        }
+
+        println!(
+            "minicore ready. agents: {}",
+            core.agents().collect::<Vec<_>>().join(", ")
+        );
+
         Self {
-            agent: AgentOrchestrator::new(memory, tools, skills),
-            llm: open_llm(&config),
+            core,
             workspace: config.workspace.clone(),
         }
     }
@@ -94,10 +107,7 @@ impl App {
     fn repl(&mut self) -> io::Result<i32> {
         let stdin = io::stdin();
         let mut stdout = io::stdout();
-        writeln!(
-            stdout,
-            "minipaw ready. Type /help for commands, /quit to exit."
-        )?;
+        writeln!(stdout, "minicore ready. Type /help for commands, /quit to exit.")?;
         write!(stdout, "> ")?;
         stdout.flush()?;
 
@@ -109,55 +119,27 @@ impl App {
             }
             if input == "/help" || input == "help" {
                 writeln!(stdout, "{}", help_text())?;
-            } else if let Some(task) = input.strip_prefix("/enqueue ") {
-                let task_id = self.agent.enqueue_task(task);
-                writeln!(stdout, "queued {task_id}")?;
-            } else if input == "/tick" {
-                match self.agent.tick(self.llm.as_mut()) {
-                    Some(outcome) => writeln!(
-                        stdout,
-                        "{} [{} {}]\n{}",
-                        outcome.task_id, outcome.status, outcome.pattern, outcome.output
-                    )?,
-                    None => writeln!(stdout, "idle")?,
-                }
-            } else if input == "/heartbeat" {
-                let heartbeat = self.agent.heartbeat();
-                writeln!(
-                    stdout,
-                    "tick={} last_task={} last_status={} queue={}",
-                    heartbeat.tick,
-                    heartbeat
-                        .last_task
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "-".to_owned()),
-                    heartbeat.last_status,
-                    self.agent.queue_len()
-                )?;
-            } else if let Some(rest) = input.strip_prefix("/pipeline ") {
-                let (initial, stages) = parse_pipeline(rest);
-                let report = self
-                    .agent
-                    .run_pipeline(&initial, &stages, self.llm.as_mut());
-                writeln!(
-                    stdout,
-                    "{} [pipeline stages={}]\n{}",
-                    report.task_id, report.stages_run, report.output
-                )?;
-            } else if let Some(rest) = input.strip_prefix("/mapreduce ") {
-                let (goal, items) = parse_map_reduce(rest);
-                let report = self.agent.run_map_reduce(&goal, &items, self.llm.as_mut());
-                writeln!(
-                    stdout,
-                    "{} [map-reduce mapped={}]\n{}",
-                    report.task_id, report.mapped, report.output
-                )?;
+            } else if let Some(rest) = input.strip_prefix("/ls") {
+                let cmd = format!("ls{}", rest);
+                let out = self.core.run_exec(&cmd);
+                writeln!(stdout, "{out}")?;
+            } else if let Some(rest) = input.strip_prefix("/read ") {
+                let out = self.core.run_exec(&format!("read {rest}"));
+                writeln!(stdout, "{out}")?;
+            } else if let Some(rest) = input.strip_prefix("/exec ") {
+                let out = self.core.run_exec(rest);
+                writeln!(stdout, "{out}")?;
             } else {
-                let outcome = self.agent.run_task(input, self.llm.as_mut());
+                let msg = IncomingMessage {
+                    text: input.to_owned(),
+                    context_id: None,
+                    source: "cli".to_owned(),
+                };
+                let report = self.core.process(msg);
                 writeln!(
                     stdout,
-                    "{} [{} {}]\n{}",
-                    outcome.task_id, outcome.status, outcome.pattern, outcome.output
+                    "{} [{}] steps={}\n{}",
+                    report.task_id, report.class, report.steps, report.output
                 )?;
             }
             write!(stdout, "> ")?;
@@ -174,25 +156,30 @@ impl App {
                     eprintln!("task new requires text");
                     return Ok(2);
                 }
-                let outcome = self.agent.run_task(&input, self.llm.as_mut());
+                let msg = IncomingMessage {
+                    text: input,
+                    context_id: None,
+                    source: "cli".to_owned(),
+                };
+                let report = self.core.process(msg);
                 println!(
-                    "{} [{} {}]\n{}",
-                    outcome.task_id, outcome.status, outcome.pattern, outcome.output
+                    "{} [{}] steps={}\n{}",
+                    report.task_id, report.class, report.steps, report.output
                 );
                 Ok(0)
             }
             Some("list") => {
-                for task in self.agent.memory().list_tasks() {
+                for task in self.core.memory().list_tasks() {
                     println!("{} [{}] {}", task.id, task.status, task.title);
                 }
                 Ok(0)
             }
             Some("show") => {
-                let Some(id) = args.get(1).and_then(|value| parse_task_id(value)) else {
+                let Some(id) = args.get(1).and_then(|v| parse_task_id(v)) else {
                     eprintln!("task show requires a task id like t1");
                     return Ok(2);
                 };
-                match self.agent.memory().get_task(id) {
+                match self.core.memory().get_task(id) {
                     Some(task) => println!(
                         "{} [{}] created={} updated={}\n{}",
                         task.id, task.status, task.created_at, task.updated_at, task.title
@@ -215,7 +202,7 @@ impl App {
                     eprintln!("memory get requires a key");
                     return Ok(2);
                 };
-                if let Some(value) = self.agent.memory().get_fact(key) {
+                if let Some(value) = self.core.memory().get_fact(key) {
                     println!("{value}");
                 }
                 Ok(0)
@@ -226,7 +213,7 @@ impl App {
                     return Ok(2);
                 };
                 let value = args[2..].join(" ");
-                self.agent.memory_mut().set_fact(key, &value);
+                self.core.memory_mut().set_fact(key, &value);
                 println!("ok");
                 Ok(0)
             }
@@ -275,7 +262,6 @@ impl App {
                         }
                     }
                 }
-
                 let Some(token) = token else {
                     eprintln!("telegram set requires --token <bot-token>");
                     return Ok(2);
@@ -289,7 +275,6 @@ impl App {
                     eprintln!("--chats must contain at least one numeric chat id");
                     return Ok(2);
                 }
-
                 write_telegram_config(&self.workspace, &token, &parsed_chats)?;
                 println!(
                     "telegram configured: token={} chats={}",
@@ -309,7 +294,9 @@ impl App {
                 Ok(0)
             }
             Some("pair") => {
-                let Some(chat_id) = args.get(1).and_then(|value| value.parse::<i64>().ok()) else {
+                let Some(chat_id) =
+                    args.get(1).and_then(|v| v.parse::<i64>().ok())
+                else {
                     eprintln!("telegram pair requires a numeric chat id");
                     return Ok(2);
                 };
@@ -324,7 +311,9 @@ impl App {
                 Ok(0)
             }
             Some("unpair") => {
-                let Some(chat_id) = args.get(1).and_then(|value| value.parse::<i64>().ok()) else {
+                let Some(chat_id) =
+                    args.get(1).and_then(|v| v.parse::<i64>().ok())
+                else {
                     eprintln!("telegram unpair requires a numeric chat id");
                     return Ok(2);
                 };
@@ -391,32 +380,14 @@ impl App {
                         );
                         match channel.admit_message(message) {
                             TelegramAdmission::Accepted(text) => {
-                                let kind = classify_message_kind(&text);
-                                // Normalize action text: strip polite prefixes so the
-                                // planner receives a clean imperative ("list src" not
-                                // "can you please list src").
-                                let task_text = match kind {
-                                    MessageKind::Action => {
-                                        normalize_action_text(&text).to_owned()
-                                    }
-                                    MessageKind::Knowledge => text.clone(),
+                                let msg = IncomingMessage {
+                                    text,
+                                    context_id: Some(chat_id.to_string()),
+                                    source: "telegram".to_owned(),
                                 };
-                                println!(
-                                    "telegram kind={} task={:?}",
-                                    match kind {
-                                        MessageKind::Action => "action",
-                                        MessageKind::Knowledge => "knowledge",
-                                    },
-                                    task_text
-                                );
-                                let outcome =
-                                    self.agent.run_task(&task_text, self.llm.as_mut());
-                                let reply = match kind {
-                                    MessageKind::Action => telegram_action_reply(&outcome),
-                                    MessageKind::Knowledge => {
-                                        telegram_user_reply(&outcome.output)
-                                    }
-                                };
+                                let report = self.core.process(msg);
+                                let reply = format_session_report(&report);
+                                println!("telegram reply [{}] steps={}", report.class, report.steps);
                                 match send_message(&token, chat_id, &reply) {
                                     Ok(()) => println!("telegram reply sent"),
                                     Err(err) => eprintln!("telegram send failed: {err}"),
@@ -444,107 +415,52 @@ impl App {
     }
 }
 
+fn format_session_report(report: &SessionReport) -> String {
+    let label = match report.class {
+        crate::types::MessageClass::MiniHow => {
+            let status_word = if report.output.starts_with("error:") {
+                "Failed"
+            } else {
+                "Done"
+            };
+            format!("{status_word}")
+        }
+        crate::types::MessageClass::MiniWhy => "Analysis".to_owned(),
+        crate::types::MessageClass::MiniWhat => "Answer".to_owned(),
+    };
+
+    let body = report.output.trim();
+    let mut reply = if body.is_empty() {
+        format!("{label}: (no output)")
+    } else {
+        format!("{label}:\n{body}")
+    };
+
+    const TELEGRAM_REPLY_LIMIT: usize = 3500;
+    if reply.len() > TELEGRAM_REPLY_LIMIT {
+        let mut end = TELEGRAM_REPLY_LIMIT;
+        while !reply.is_char_boundary(end) {
+            end -= 1;
+        }
+        reply.truncate(end);
+        reply.push_str("\n[truncated]");
+    }
+    reply
+}
+
 fn pairing_chat_id(text: &str) -> Option<i64> {
     text.lines()
         .find_map(|line| line.strip_prefix("chat_id="))
         .and_then(|raw| raw.parse::<i64>().ok())
 }
 
-fn telegram_action_reply(outcome: &AgentOutcome) -> String {
-    let label = match outcome.status {
-        TaskStatus::Done => "Done",
-        TaskStatus::Failed => "Failed",
-        TaskStatus::Waiting => "Awaiting approval",
-        _ => "In progress",
-    };
-    let body = outcome.output.trim();
-    let mut reply = if body.is_empty() {
-        format!("{label}: (no output)")
-    } else {
-        format!("{label}:\n{body}")
-    };
-    const TELEGRAM_REPLY_LIMIT: usize = 3500;
-    if reply.len() > TELEGRAM_REPLY_LIMIT {
-        let mut end = TELEGRAM_REPLY_LIMIT;
-        while !reply.is_char_boundary(end) {
-            end -= 1;
-        }
-        reply.truncate(end);
-        reply.push_str("\n[truncated]");
-    }
-    reply
-}
-
-fn telegram_user_reply(output: &str) -> String {
-    let mut lines = Vec::new();
-    for line in output.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("context:")
-            || lower.starts_with("memory index:")
-            || lower.starts_with("selected memory details:")
-            || lower.starts_with("task:")
-            || lower.starts_with("system:")
-            || lower.starts_with("user:")
-            || lower.starts_with("assistant:")
-            || lower.starts_with("you are an ai assistant")
-            || lower.starts_with("your task")
-            || lower.starts_with("you must")
-        {
-            continue;
-        }
-        lines.push(line);
-    }
-
-    let mut reply = lines.join("\n").trim().to_owned();
-    if reply.is_empty() {
-        reply = "I could not produce a clean reply for that message.".to_owned();
-    }
-    const TELEGRAM_REPLY_LIMIT: usize = 3500;
-    if reply.len() > TELEGRAM_REPLY_LIMIT {
-        let mut end = TELEGRAM_REPLY_LIMIT;
-        while !reply.is_char_boundary(end) {
-            end -= 1;
-        }
-        reply.truncate(end);
-        reply.push_str("\n[truncated]");
-    }
-    reply
-}
-
-fn parse_pipeline(rest: &str) -> (String, Vec<PipelineStage>) {
-    let mut parts = rest
-        .split('|')
-        .map(str::trim)
-        .filter(|part| !part.is_empty());
-    let initial = parts.next().unwrap_or_default().to_owned();
-    let stages = parts
-        .enumerate()
-        .map(|(index, input)| PipelineStage {
-            name: format!("stage-{}", index + 1),
-            input: input.to_owned(),
-        })
-        .collect();
-    (initial, stages)
-}
-
-fn parse_map_reduce(rest: &str) -> (String, Vec<String>) {
-    let mut parts = rest
-        .split('|')
-        .map(str::trim)
-        .filter(|part| !part.is_empty());
-    let goal = parts.next().unwrap_or_default().to_owned();
-    let items = parts.map(str::to_owned).collect();
-    (goal, items)
-}
-
-fn parse_task_id(value: &str) -> Option<TaskId> {
+fn parse_task_id(value: &str) -> Option<crate::types::TaskId> {
     value
         .strip_prefix('t')
         .unwrap_or(value)
         .parse::<u64>()
         .ok()
-        .map(TaskId)
+        .map(crate::types::TaskId)
 }
 
 fn parse_chat_ids(value: &str) -> std::collections::BTreeSet<i64> {
@@ -582,7 +498,6 @@ fn open_memory(config: &AgentConfig) -> Box<dyn MemoryStore> {
             Err(err) => eprintln!("sqlite unavailable, using in-memory store: {err}"),
         }
     }
-
     Box::new(InMemoryStore::new(config.history_limit))
 }
 
@@ -593,6 +508,5 @@ fn open_llm(config: &AgentConfig) -> Box<dyn LlmClient> {
             Err(err) => eprintln!("llm config unavailable, using offline provider: {err}"),
         }
     }
-
     Box::new(OfflineLlm)
 }
