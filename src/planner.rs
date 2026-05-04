@@ -431,7 +431,9 @@ pub fn classify_message(context: &str, llm: &mut dyn LlmClient) -> MessageClass 
          Message:\n{context}"
     );
     let response = llm.next_step(&prompt);
-    parse_message_class(&response).unwrap_or(MessageClass::MiniWhat)
+    let class = parse_message_class(&response).unwrap_or(MessageClass::MiniWhat);
+    println!("classify class={class}");
+    class
 }
 
 fn parse_message_class(response: &str) -> Option<MessageClass> {

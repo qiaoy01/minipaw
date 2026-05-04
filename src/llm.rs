@@ -170,8 +170,10 @@ impl LlamaCppClient {
 
 impl LlmClient for LlamaCppClient {
     fn chat(&mut self, system: &str, messages: &[ChatMessage]) -> String {
-        self.complete_chat(system, messages)
-            .unwrap_or_else(|err| format!("llm request failed: {err}"))
+        self.complete_chat(system, messages).unwrap_or_else(|err| {
+            eprintln!("llm error: {err}");
+            format!("llm request failed: {err}")
+        })
     }
 }
 

@@ -107,6 +107,11 @@ impl MiniCore {
             task.id
         };
 
+        println!(
+            "minicore task={task_id} class={class} source={} resumed={}",
+            msg.source,
+            prior_task_id.is_some()
+        );
         self.memory.append_message(task_id, "user", &msg.text);
         self.memory.update_task_status(task_id, TaskStatus::Running);
         let (output, steps) = self.run_session(task_id, &msg.text, &context, class);
@@ -215,8 +220,14 @@ impl MiniCore {
             });
 
             if let Some(ref d) = directive {
-                if let Some(rest) = d.strip_prefix("DONE:") {
-                    let output = rest.trim().to_owned();
+                if d.starts_with("DONE:") {
+                    // Capture everything after DONE: including subsequent lines,
+                    // since the LLM often puts the full answer on multiple lines.
+                    let output = match response.find("DONE:") {
+                        Some(pos) => response[pos + "DONE:".len()..].trim().to_owned(),
+                        None => d["DONE:".len()..].trim().to_owned(),
+                    };
+                    println!("minihow done task={task_id} steps={steps}");
                     messages.push(ChatMessage::assistant(response));
                     self.memory.append_message(task_id, "advisor", &output);
                     return (output, steps);
@@ -258,11 +269,13 @@ impl MiniCore {
 
             // No directive found — free-form response, treat as final answer.
             let output = response.trim().to_owned();
+            println!("minihow free-form task={task_id} steps={steps}");
             messages.push(ChatMessage::assistant(response));
             self.memory.append_message(task_id, "advisor", &output);
             return (output, steps);
         }
 
+        eprintln!("minihow step-limit task={task_id}");
         let output = format!("Session reached step limit ({MAX_SESSION_STEPS}).");
         (output, steps)
     }
@@ -281,6 +294,7 @@ impl MiniCore {
 
         for _ in 0..MAX_SESSION_STEPS {
             steps += 1;
+            println!("miniwhy step={steps} task={task_id}");
             let response = self.llm.chat(&system, &messages);
             let first_line = response.lines().next().unwrap_or("").trim().to_owned();
 
@@ -293,6 +307,7 @@ impl MiniCore {
                     MEMORY_DETAIL_BYTES,
                 );
                 let data = memory.render();
+                println!("miniwhy data-fetch task={task_id} query={query:?} bytes={}", data.len());
                 self.memory.append_message(task_id, "data-fetch", &data);
 
                 messages.push(ChatMessage::assistant(response));
@@ -301,17 +316,20 @@ impl MiniCore {
             }
 
             let output = response.trim().to_owned();
+            println!("miniwhy done task={task_id} steps={steps}");
             messages.push(ChatMessage::assistant(response));
             self.memory.append_message(task_id, "advisor", &output);
             return (output, steps);
         }
 
+        eprintln!("miniwhy step-limit task={task_id}");
         let output = format!("Analysis reached step limit ({MAX_SESSION_STEPS}).");
         (output, steps)
     }
 
     // MiniWhat: query task — single LLM call with SOUL + memory context in the system prompt.
     fn run_miniwhat(&mut self, task_id: TaskId, context: &str) -> (String, usize) {
+        println!("miniwhat task={task_id}");
         let memory = self.memory.progressive_memory(
             context,
             MEMORY_INDEX_LIMIT,
