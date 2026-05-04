@@ -422,10 +422,12 @@ pub fn classify_message(context: &str, llm: &mut dyn LlmClient) -> MessageClass 
         "Classify the intent of this message into exactly one category.\n\
          Categories:\n\
          minihow - the user wants to execute something, perform an action, compute a result, \
-         do arithmetic or math, read/write files, run a command, or get something done\n\
+         do arithmetic or math, read/write files, run a command, get something done, \
+         or needs live local system state (e.g. current time, available memory, disk usage, \
+         running processes, network info) that can only be determined by running a command\n\
          miniwhy - the user wants to understand, analyze, or reason about information\n\
-         miniwhat - the user wants to query or retrieve a known fact, definition, or stored information \
-         (no computation needed)\n\
+         miniwhat - the user wants to query or retrieve a known static fact, definition, \
+         concept, or stored information that does not require checking the live system\n\
          When in doubt between minihow and miniwhat, choose minihow.\n\
          Reply with only the category name.\n\
          Message:\n{context}"

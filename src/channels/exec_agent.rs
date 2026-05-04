@@ -45,7 +45,8 @@ fn parse_exec_command(command: &str) -> PlanStepKind {
     };
     match verb {
         "read" | "cat" => {
-            let path = iter.collect::<Vec<_>>().join(" ");
+            // Drop option tokens (starting with '-') before collecting the path.
+            let path = iter.filter(|t| !t.starts_with('-')).collect::<Vec<_>>().join(" ");
             if path.is_empty() {
                 PlanStepKind::Answer("read requires a path".to_owned())
             } else {
@@ -53,7 +54,9 @@ fn parse_exec_command(command: &str) -> PlanStepKind {
             }
         }
         "ls" | "list" => {
-            let path = iter.collect::<Vec<_>>().join(" ");
+            // Drop option tokens (e.g. "-la", "-1") before collecting the path
+            // so that "ls -la /some/path" correctly resolves to ListDir("/some/path").
+            let path = iter.filter(|t| !t.starts_with('-')).collect::<Vec<_>>().join(" ");
             PlanStepKind::ListDir(if path.is_empty() {
                 ".".to_owned()
             } else {

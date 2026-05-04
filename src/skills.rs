@@ -60,6 +60,26 @@ impl SkillRegistry {
             .find(|s| s.name.to_ascii_lowercase() == lower)
     }
 
+    /// Return the first executable skill whose name+description terms overlap
+    /// with the input. Used to upgrade miniwhat classification to minihow when
+    /// a registered skill can handle the request without LLM reasoning.
+    pub fn match_for_input(&self, input: &str) -> Option<&Skill> {
+        let input_terms = skill_terms(input);
+        if input_terms.is_empty() {
+            return None;
+        }
+        self.skills.iter().find(|skill| {
+            if skill.exec.is_none() {
+                return false;
+            }
+            let mut text = skill.name.replace('-', " ");
+            text.push(' ');
+            text.push_str(&skill.description);
+            let skill_t = skill_terms(&text);
+            input_terms.iter().any(|t| skill_t.contains(t))
+        })
+    }
+
     /// All exec program names defined by skills. Used to auto-trust skill
     /// commands in the tool policy so operator-curated skills run without
     /// requiring MINIPAW_ALLOW_EXEC in the environment.
@@ -70,6 +90,26 @@ impl SkillRegistry {
                 .and_then(|e| e.split_whitespace().next())
         })
     }
+}
+
+/// Extract meaningful terms for skill matching. Strips tokens that are too
+/// short or too generic to distinguish one skill from another.
+fn skill_terms(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|t| t.len() >= 3 && !is_generic_word(t))
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_generic_word(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "the" | "and" | "for" | "get" | "use" | "run" | "show" | "give" | "tell"
+            | "what" | "how" | "who" | "why" | "when" | "where" | "its" | "that"
+            | "this" | "with" | "from" | "into" | "about" | "are" | "was" | "were"
+            | "have" | "has" | "had" | "been" | "can" | "will" | "would" | "should"
+            | "may" | "might" | "make" | "does" | "just" | "now" | "not"
+    )
 }
 
 fn parse_skill_file(content: &str) -> Option<Skill> {
@@ -163,6 +203,30 @@ mod tests {
         assert!(registry.find("current-time").is_some());
         assert!(registry.find("Current-Time").is_some());
         assert!(registry.find("unknown").is_none());
+    }
+
+    #[test]
+    fn match_for_input_returns_executable_skill_on_term_overlap() {
+        let registry = SkillRegistry {
+            skills: vec![
+                Skill {
+                    name: "current-time".into(),
+                    description: "Get the current date and time on the local machine".into(),
+                    exec: Some("date".into()),
+                },
+                Skill {
+                    name: "greet".into(),
+                    description: "Greet the user warmly".into(),
+                    exec: None,
+                },
+            ],
+        };
+        // Input shares "time" with current-time name/description.
+        assert!(registry.match_for_input("what time is it").is_some());
+        // Skill without exec is ignored even if terms match.
+        assert!(registry.match_for_input("greet me").is_none());
+        // No overlap at all.
+        assert!(registry.match_for_input("list my files").is_none());
     }
 
     #[test]

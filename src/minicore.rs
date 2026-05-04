@@ -6,7 +6,7 @@ use crate::skills::SkillRegistry;
 use crate::tools::ToolRunner;
 use crate::types::{MessageClass, TaskId, TaskStatus};
 
-const MAX_SESSION_STEPS: usize = 8;
+const MAX_SESSION_STEPS: usize = 16;
 const CONTEXT_MAX_BYTES: usize = 2048;
 const MEMORY_INDEX_LIMIT: usize = 12;
 const MEMORY_DETAIL_LIMIT: usize = 4;
@@ -32,7 +32,7 @@ pub struct MiniCore {
     pub(crate) memory: Box<dyn MemoryStore>,
     pub(crate) llm: Box<dyn LlmClient>,
     tools: ToolRunner,
-    _skills: SkillRegistry,
+    skills: SkillRegistry,
     agents: Vec<Box<dyn AgentHandler>>,
     os_info: String,
 }
@@ -49,7 +49,7 @@ impl MiniCore {
             llm,
             os_info: detect_os_info(),
             tools,
-            _skills: skills,
+            skills,
             agents: Vec::new(),
         }
     }
@@ -95,6 +95,19 @@ impl MiniCore {
         let (prior_task_id, context) = self.assemble_context(&msg);
 
         let class = classify_message(&context, self.llm.as_mut());
+
+        // Skill-override: if a registered executable skill matches the input
+        // and the classifier chose miniwhat (no tool access), upgrade to minihow
+        // so the EXEC/DONE loop can invoke it. This compensates for small models
+        // that conflate "query a fact" with "run a tool to get a live value".
+        let class = if class == MessageClass::MiniWhat
+            && self.skills.match_for_input(&msg.text).is_some()
+        {
+            println!("classify class=minihow (skill-override)");
+            MessageClass::MiniHow
+        } else {
+            class
+        };
 
         let task_id = if let Some(tid) = prior_task_id {
             tid
@@ -185,9 +198,12 @@ impl MiniCore {
              1. NEVER compute arithmetic yourself — use EXEC: python3 -c \"print(expr)\" for all math.\n\
              2. When reading a file, use EXEC: cat <path> or python3 -c \"print(int(open('<path>').read().strip()) + N)\".\n\
              3. ALWAYS cast file contents to int before arithmetic: int(open(path).read().strip()).\n\
-             4. Once the result you need appears in the conversation, issue DONE immediately.\n\
+             4. Do NOT issue DONE until EVERY requested step has been executed and its result appears in the conversation.\n\
              5. If EXEC is denied, try an alternative. Only give up when no alternative exists.\n\
-             6. Put EXEC: or DONE: on line 1. Never write text before the directive.",
+             6. Put EXEC: or DONE: on line 1. Never write text before the directive.\n\
+             7. NEVER use heredocs (<< 'EOF') — stdin is closed and they produce empty output. \
+             To write a multi-line script use: EXEC: python3 -c \"open('/tmp/_s.py','w').write('...')\" then EXEC: python3 /tmp/_s.py.\n\
+             8. Only report values that appeared in an EXEC result. Label any inference as 'inferred, not verified'.",
             self.os_info
         );
 
@@ -300,6 +316,16 @@ impl MiniCore {
 
             if let Some(query) = first_line.strip_prefix("DATA:") {
                 let query = query.trim();
+                // Guard: reject shell-like content in DATA: — the LLM sometimes
+                // tries to embed exec directives here. Treat those responses as
+                // final answers instead of memory fetches.
+                if !data_query_is_safe(query) {
+                    println!("miniwhy data-rejected task={task_id} query={query:?}");
+                    let output = response.trim().to_owned();
+                    messages.push(ChatMessage::assistant(response));
+                    self.memory.append_message(task_id, "advisor", &output);
+                    return (output, steps);
+                }
                 let memory = self.memory.progressive_memory(
                     query,
                     MEMORY_INDEX_LIMIT,
@@ -339,6 +365,8 @@ impl MiniCore {
         let system = format!(
             "{SOUL}\n\n\
              You are a query advisor. Answer the question concisely.\n\
+             If your answer may be incomplete, outdated, or based on uncertain \
+             knowledge, say so explicitly at the start of your response.\n\
              {}",
             memory.render()
         );
@@ -377,6 +405,19 @@ impl MiniCore {
         }
         "error: no exec agent registered".to_owned()
     }
+}
+
+/// Return true when a DATA: query looks like a plain memory/search string.
+/// Rejects shell-like content so the LLM cannot misuse DATA: as an exec path.
+fn data_query_is_safe(query: &str) -> bool {
+    !query.contains('|')
+        && !query.contains(';')
+        && !query.contains("&&")
+        && !query.contains("$(")
+        && !query.contains("exec.")
+        && !query.starts_with('/')
+        && !query.contains(">>")
+        && !query.contains('<')
 }
 
 fn detect_os_info() -> String {
