@@ -31,7 +31,14 @@ impl AgentHandler for ExecAgent {
 }
 
 fn parse_exec_command(command: &str) -> PlanStepKind {
-    let parts = shell_split(command.trim());
+    let trimmed = command.trim();
+    if has_shell_metachar(trimmed) {
+        return PlanStepKind::Exec {
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), trimmed.to_owned()],
+        };
+    }
+    let parts = shell_split(trimmed);
     let mut iter = parts.iter().map(String::as_str);
     let Some(verb) = iter.next() else {
         return PlanStepKind::Answer("(empty command)".to_owned());
@@ -59,6 +66,26 @@ fn parse_exec_command(command: &str) -> PlanStepKind {
             PlanStepKind::Exec { program, args }
         }
     }
+}
+
+/// Return true when `command` contains shell metacharacters outside of quotes.
+fn has_shell_metachar(command: &str) -> bool {
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' | '\'' => {
+                let quote = ch;
+                for c in chars.by_ref() {
+                    if c == quote {
+                        break;
+                    }
+                }
+            }
+            '>' | '<' | '|' | ';' | '&' => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Split a command string into tokens respecting single and double quotes.

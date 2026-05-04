@@ -338,7 +338,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::llm::{LlmClient, OfflineLlm};
+    use crate::llm::{ChatMessage, LlmClient, OfflineLlm};
     use crate::memory::InMemoryStore;
     use crate::tools::ToolPolicy;
 
@@ -352,6 +352,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 allow_exec: false,
                 allowed_exec: BTreeSet::new(),
+                skill_exec: BTreeSet::new(),
             }),
             crate::skills::SkillRegistry::default(),
         )
@@ -370,7 +371,7 @@ mod tests {
     }
 
     impl LlmClient for ScriptedLlm {
-        fn next_step(&mut self, _prompt: &str) -> String {
+        fn chat(&mut self, _system: &str, _messages: &[ChatMessage]) -> String {
             self.responses
                 .pop_front()
                 .unwrap_or_else(|| "direct".into())

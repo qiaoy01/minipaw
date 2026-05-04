@@ -244,28 +244,55 @@ fn parse_i64_prefix(text: &str) -> Option<i64> {
 
 fn parse_json_string_tail(text: &str) -> Option<String> {
     let mut out = String::new();
-    let mut escaped = false;
-    for ch in text.chars() {
-        if escaped {
-            out.push(match ch {
-                '"' => '"',
-                '\\' => '\\',
-                '/' => '/',
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                other => other,
-            });
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            return Some(out);
-        } else {
-            out.push(ch);
+    let mut chars = text.chars();
+    loop {
+        match chars.next()? {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                    if hex.len() == 4 {
+                        if let Ok(code) = u16::from_str_radix(&hex, 16) {
+                            decode_utf16_codeunit(code, &mut chars, &mut out);
+                        }
+                    }
+                }
+                other => out.push(other),
+            },
+            ch => out.push(ch),
         }
     }
-    None
+}
+
+fn decode_utf16_codeunit(code: u16, chars: &mut impl Iterator<Item = char>, out: &mut String) {
+    // High surrogate — consume the following \uXXXX low surrogate.
+    if (0xD800..0xDC00).contains(&code) {
+        // Expect \u immediately after.
+        if chars.next() == Some('\\') && chars.next() == Some('u') {
+            let hex2: String = (0..4).filter_map(|_| chars.next()).collect();
+            if hex2.len() == 4 {
+                if let Ok(low) = u16::from_str_radix(&hex2, 16) {
+                    let codepoint =
+                        0x10000u32 + ((code as u32 - 0xD800) << 10) + (low as u32 - 0xDC00);
+                    if let Some(c) = char::from_u32(codepoint) {
+                        out.push(c);
+                        return;
+                    }
+                }
+            }
+        }
+        // Malformed surrogate pair — skip.
+        return;
+    }
+    if let Some(c) = char::from_u32(code as u32) {
+        out.push(c);
+    }
 }
 
 #[cfg(test)]
@@ -376,5 +403,25 @@ mod tests {
         assert_eq!(updates[0].update_id, 7);
         assert_eq!(updates[0].chat_id, 42);
         assert_eq!(updates[0].text, "hello\nworld");
+    }
+
+    #[test]
+    fn decodes_unicode_escapes_in_telegram_text() {
+        // 告 = 告, 诉 = 诉, 我 = 我, 等 = 等, 于 = 于, 多 = 多, 少 = 少
+        let body = r#"{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":42,"type":"private"},"text":"告诉我8*17等于多少"}}]}"#;
+        let updates = parse_updates(body);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].text, "告诉我8*17等于多少");
+    }
+
+    #[test]
+    fn decodes_surrogate_pair_emoji() {
+        // 😀 = U+1F600, encoded as surrogate pair 😀
+        let body = r#"{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":42,"type":"private"},"text":"hi 😀"}}]}"#;
+        let updates = parse_updates(body);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].text, "hi 😀");
     }
 }

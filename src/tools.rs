@@ -218,6 +218,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             allow_exec: false,
             allowed_exec: BTreeSet::new(),
+            skill_exec: BTreeSet::new(),
         });
 
         let result = runner.run_step(&PlanStepKind::Exec {
