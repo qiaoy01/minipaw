@@ -7,7 +7,7 @@ use crate::tools::ToolRunner;
 use crate::types::{MessageClass, TaskId, TaskStatus};
 
 const MAX_SESSION_STEPS: usize = 16;
-const CONTEXT_MAX_BYTES: usize = 2048;
+const CONTEXT_MAX_BYTES: usize = 6144;
 const MEMORY_INDEX_LIMIT: usize = 12;
 const MEMORY_DETAIL_LIMIT: usize = 4;
 const MEMORY_DETAIL_BYTES: usize = 512;
@@ -201,9 +201,15 @@ impl MiniCore {
              4. Do NOT issue DONE until EVERY requested step has been executed and its result appears in the conversation.\n\
              5. If EXEC is denied, try an alternative. Only give up when no alternative exists.\n\
              6. Put EXEC: or DONE: on line 1. Never write text before the directive.\n\
-             7. NEVER use heredocs (<< 'EOF') — stdin is closed and they produce empty output. \
-             To write a multi-line script use: EXEC: python3 -c \"open('/tmp/_s.py','w').write('...')\" then EXEC: python3 /tmp/_s.py.\n\
-             8. Only report values that appeared in an EXEC result. Label any inference as 'inferred, not verified'.",
+             7. Every EXEC: command MUST fit on a single line — no newlines inside the command. \
+             Chain Python statements with semicolons: python3 -c \"stmt1; stmt2; stmt3\". \
+             NEVER use heredocs or multi-line python3 -c strings — only the first line is read.\n\
+             8. When a computation involves multiple distinct quantities, print each one \
+             on its own labeled line before printing the combined result, e.g.: \
+             python3 -c \"h=16; ts=1234; print(f'hour={{h}} ts={{ts}} total={{ts+h}}')\". \
+             This makes every intermediate value traceable.\n\
+             9. In DONE, only cite numbers that explicitly appeared in prior EXEC output. \
+             Do not reconstruct arithmetic from memory — re-read the EXEC results above.",
             self.os_info
         );
 

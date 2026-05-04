@@ -119,6 +119,14 @@ impl App {
                 println!("{}", help_text());
                 Ok(0)
             }
+            Some("--version") | Some("-V") | Some("version") => {
+                println!(
+                    "minipaw {} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("MINIPAW_GIT_HASH")
+                );
+                Ok(0)
+            }
             Some(other) => {
                 eprintln!("unknown command: {other}");
                 eprintln!("{}", help_text());
