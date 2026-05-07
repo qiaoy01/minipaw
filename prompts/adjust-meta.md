@@ -16,6 +16,12 @@ Hard constraints:
 - Do not propose multiple changes in one response.
 - Do not propose changes that would weaken safety (e.g. disabling guardrails, suppressing uncertainty).
 
+Redundancy check (do this BEFORE choosing a directive):
+- Read every numbered rule in current_system_prompt.
+- If any existing rule already addresses the behavior gap — even with different wording or examples — respond with NO_CHANGE. Do not propose a near-duplicate just because the phrasing differs.
+- If primary's output is already correct (e.g. it ran the right EXEC and reported the real value), respond with NO_CHANGE; the divergence is a shadow artifact, not a behavior gap.
+- Only propose PROMPT_RULE_APPEND when the gap is concrete, not covered by any existing rule, and the new rule would change primary's future behavior on this exact failure mode.
+
 Inputs:
 class={{class}}
 task={{task}}
