@@ -49,7 +49,7 @@ pub struct Task {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MessageClass {
     MiniHow,
     MiniWhy,
@@ -62,6 +62,76 @@ impl fmt::Display for MessageClass {
             Self::MiniHow => f.write_str("minihow"),
             Self::MiniWhy => f.write_str("miniwhy"),
             Self::MiniWhat => f.write_str("miniwhat"),
+        }
+    }
+}
+
+impl MessageClass {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "minihow" | "how" => Some(Self::MiniHow),
+            "miniwhy" | "why" => Some(Self::MiniWhy),
+            "miniwhat" | "what" => Some(Self::MiniWhat),
+            _ => None,
+        }
+    }
+}
+
+/// Advisor lifecycle stage. Determines whether the local primary LLM, the
+/// remote advisor LLM, or both are exercised on each request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvisorMode {
+    /// Send every request to both models; advisor's answer is authoritative.
+    Training,
+    /// Route per message class; shadow the unselected model for divergence data.
+    Trial,
+    /// Route per message class; do not shadow.
+    Working,
+}
+
+impl fmt::Display for AdvisorMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Training => f.write_str("training"),
+            Self::Trial => f.write_str("trial"),
+            Self::Working => f.write_str("working"),
+        }
+    }
+}
+
+impl AdvisorMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "training" | "train" => Some(Self::Training),
+            "trial" => Some(Self::Trial),
+            "working" | "work" => Some(Self::Working),
+            _ => None,
+        }
+    }
+}
+
+/// Which configured LLM should answer a given request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentChoice {
+    Primary,
+    Advisor,
+}
+
+impl fmt::Display for AgentChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Primary => f.write_str("primary"),
+            Self::Advisor => f.write_str("advisor"),
+        }
+    }
+}
+
+impl AgentChoice {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "primary" | "small" | "local" => Some(Self::Primary),
+            "advisor" | "large" | "remote" => Some(Self::Advisor),
+            _ => None,
         }
     }
 }

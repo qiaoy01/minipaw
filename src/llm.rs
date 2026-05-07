@@ -48,18 +48,21 @@ impl LlmClient for OfflineLlm {
 pub struct LlamaCppClient {
     endpoint: HttpEndpoint,
     model: String,
+    api_key: Option<String>,
     thinking: bool,
     timeout: Duration,
 }
 
 impl LlamaCppClient {
     pub fn from_config(config: &LlmConfig) -> Result<Self, String> {
-        if config.provider != "llamacpp" {
-            return Err(format!("unsupported provider: {}", config.provider));
+        match config.provider.as_str() {
+            "llamacpp" | "deepseek" | "openai" => {}
+            other => return Err(format!("unsupported provider: {other}")),
         }
         Ok(Self {
             endpoint: HttpEndpoint::parse(&config.url)?,
             model: config.model.clone(),
+            api_key: config.api_key.clone(),
             thinking: config.thinking,
             timeout: if config.thinking {
                 Duration::from_secs(300)
@@ -138,25 +141,27 @@ impl LlamaCppClient {
     }
 
     fn post(&self, path: &str, body: &str) -> Result<String, String> {
-        if self.endpoint.scheme != "http" {
-            return Err("only plain http endpoints are supported in the minimal client".to_owned());
-        }
         let full_path = join_path(&self.endpoint.base_path, path);
         let url = format!(
             "{}://{}:{}{}",
             self.endpoint.scheme, self.endpoint.host, self.endpoint.port, full_path
         );
-        let output = Command::new("curl")
-            .arg("--fail")
+        let mut cmd = Command::new("curl");
+        cmd.arg("--fail")
             .arg("--silent")
             .arg("--show-error")
             .arg("--max-time")
             .arg(self.timeout.as_secs().to_string())
             .arg("-H")
-            .arg("Content-Type: application/json")
-            .arg("-d")
-            .arg(body)
-            .arg(url)
+            .arg("Content-Type: application/json");
+        if let Some(key) = &self.api_key {
+            if !key.is_empty() {
+                cmd.arg("-H").arg(format!("Authorization: Bearer {key}"));
+            }
+        }
+        cmd.arg("-d").arg(body).arg(url);
+
+        let output = cmd
             .output()
             .map_err(|err| format!("curl llm request failed: {err}"))?;
 

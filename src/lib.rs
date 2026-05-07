@@ -1,3 +1,5 @@
+pub mod adjustments;
+pub mod advisor;
 pub mod agent;
 pub mod channels;
 pub mod cli;
@@ -7,6 +9,7 @@ pub mod memory;
 pub mod minicore;
 pub mod orchestration;
 pub mod planner;
+pub mod prompts;
 pub mod skills;
 pub mod tools;
 pub mod types;

@@ -1,10 +1,15 @@
+use crate::adjustments::{
+    apply_training, parse_directive, write_proposal, AdjustmentDirective,
+};
+use crate::advisor::{compare, DivergenceRecord, DivergenceVerdict};
 use crate::channels::AgentHandler;
 use crate::llm::{ChatMessage, LlmClient};
 use crate::memory::MemoryStore;
 use crate::planner::classify_message;
+use crate::prompts::PromptStore;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRunner;
-use crate::types::{MessageClass, TaskId, TaskStatus};
+use crate::types::{AdvisorMode, AgentChoice, MessageClass, TaskId, TaskStatus};
 
 const MAX_SESSION_STEPS: usize = 16;
 const CONTEXT_MAX_BYTES: usize = 6144;
@@ -14,6 +19,7 @@ const MEMORY_DETAIL_BYTES: usize = 512;
 
 // Embedded at compile time so it is always available regardless of install path.
 const SOUL: &str = include_str!("../SOUL.md");
+const MAX_RULE_APPENDS_PER_CLASS: usize = 24;
 
 pub struct IncomingMessage {
     pub text: String,
@@ -31,8 +37,12 @@ pub struct SessionReport {
 pub struct MiniCore {
     pub(crate) memory: Box<dyn MemoryStore>,
     pub(crate) llm: Box<dyn LlmClient>,
+    advisor: Option<Box<dyn LlmClient>>,
+    advisor_mode: AdvisorMode,
+    routing: std::collections::BTreeMap<MessageClass, AgentChoice>,
     tools: ToolRunner,
     skills: SkillRegistry,
+    prompts: PromptStore,
     agents: Vec<Box<dyn AgentHandler>>,
     os_info: String,
 }
@@ -43,15 +53,41 @@ impl MiniCore {
         llm: Box<dyn LlmClient>,
         tools: ToolRunner,
         skills: SkillRegistry,
+        prompts: PromptStore,
     ) -> Self {
         Self {
             memory,
             llm,
+            advisor: None,
+            advisor_mode: AdvisorMode::Working,
+            routing: std::collections::BTreeMap::new(),
             os_info: detect_os_info(),
             tools,
             skills,
+            prompts,
             agents: Vec::new(),
         }
+    }
+
+    /// Attach a remote advisor LLM and configure routing. When the advisor is
+    /// unset, MiniCore behaves exactly as before (primary handles everything).
+    pub fn set_advisor(
+        &mut self,
+        advisor: Box<dyn LlmClient>,
+        mode: AdvisorMode,
+        routing: std::collections::BTreeMap<MessageClass, AgentChoice>,
+    ) {
+        self.advisor = Some(advisor);
+        self.advisor_mode = mode;
+        self.routing = routing;
+    }
+
+    pub fn advisor_mode(&self) -> AdvisorMode {
+        self.advisor_mode
+    }
+
+    pub fn has_advisor(&self) -> bool {
+        self.advisor.is_some()
     }
 
     pub fn register(&mut self, agent: Box<dyn AgentHandler>) {
@@ -94,6 +130,8 @@ impl MiniCore {
 
         let (prior_task_id, context) = self.assemble_context(&msg);
 
+        // Classification always runs through the primary so the advisor is not
+        // billed for the routing decision itself.
         let class = classify_message(&context, self.llm.as_mut());
 
         // Skill-override: if a registered executable skill matches the input
@@ -120,14 +158,23 @@ impl MiniCore {
             task.id
         };
 
+        let executor = self.choose_executor(class);
         println!(
-            "minicore task={task_id} class={class} source={} resumed={}",
+            "minicore task={task_id} class={class} source={} resumed={} mode={} executor={}",
             msg.source,
-            prior_task_id.is_some()
+            prior_task_id.is_some(),
+            self.advisor_mode,
+            executor,
         );
         self.memory.append_message(task_id, "user", &msg.text);
         self.memory.update_task_status(task_id, TaskStatus::Running);
-        let (output, steps) = self.run_session(task_id, &msg.text, &context, class);
+
+        let (output, steps) = self.run_with_executor(task_id, &msg.text, &context, class, executor);
+
+        if self.should_shadow(executor) {
+            self.run_shadow(task_id, &context, class, executor, &output);
+        }
+
         let final_status = if output.starts_with("error:") {
             TaskStatus::Failed
         } else {
@@ -142,6 +189,213 @@ impl MiniCore {
             output,
             steps,
         }
+    }
+
+    fn choose_executor(&self, class: MessageClass) -> AgentChoice {
+        if self.advisor.is_none() {
+            return AgentChoice::Primary;
+        }
+        match self.advisor_mode {
+            // In training the advisor is the trusted teacher; primary is shadowed.
+            AdvisorMode::Training => AgentChoice::Advisor,
+            AdvisorMode::Trial | AdvisorMode::Working => self
+                .routing
+                .get(&class)
+                .copied()
+                .unwrap_or(AgentChoice::Primary),
+        }
+    }
+
+    fn should_shadow(&self, executor: AgentChoice) -> bool {
+        if self.advisor.is_none() {
+            return false;
+        }
+        match self.advisor_mode {
+            AdvisorMode::Training | AdvisorMode::Trial => true,
+            // Working mode: route deterministically, do not shadow.
+            AdvisorMode::Working => {
+                let _ = executor;
+                false
+            }
+        }
+    }
+
+    fn run_with_executor(
+        &mut self,
+        task_id: TaskId,
+        input: &str,
+        context: &str,
+        class: MessageClass,
+        executor: AgentChoice,
+    ) -> (String, usize) {
+        match executor {
+            AgentChoice::Primary => {
+                let mut llm = std::mem::replace(&mut self.llm, Box::new(crate::llm::OfflineLlm));
+                let result = self.run_session(task_id, input, context, class, llm.as_mut());
+                self.llm = llm;
+                result
+            }
+            AgentChoice::Advisor => {
+                let Some(mut llm) = self.advisor.take() else {
+                    return self.run_with_executor(task_id, input, context, class, AgentChoice::Primary);
+                };
+                let result = self.run_session(task_id, input, context, class, llm.as_mut());
+                self.advisor = Some(llm);
+                result
+            }
+        }
+    }
+
+    fn run_shadow(
+        &mut self,
+        task_id: TaskId,
+        context: &str,
+        class: MessageClass,
+        executor: AgentChoice,
+        primary_output: &str,
+    ) {
+        let shadow_choice = match executor {
+            AgentChoice::Primary => AgentChoice::Advisor,
+            AgentChoice::Advisor => AgentChoice::Primary,
+        };
+        let shadow_output = self.run_shadow_query(context, shadow_choice);
+        let Some(shadow) = shadow_output else {
+            return;
+        };
+
+        // Order outputs as (primary, advisor) regardless of which one served.
+        let (primary_text, advisor_text) = match executor {
+            AgentChoice::Primary => (primary_output.to_owned(), shadow),
+            AgentChoice::Advisor => (shadow, primary_output.to_owned()),
+        };
+        let record = compare(class, executor, &primary_text, &advisor_text);
+        self.record_divergence(task_id, &record);
+
+        if record.verdict == DivergenceVerdict::Divergent {
+            self.run_adjustment(task_id, context, class, &primary_text, &advisor_text);
+        }
+    }
+
+    fn run_adjustment(
+        &mut self,
+        task_id: TaskId,
+        context: &str,
+        class: MessageClass,
+        primary_output: &str,
+        advisor_output: &str,
+    ) {
+        if self.advisor.is_none() {
+            return;
+        }
+        if self.advisor_mode == AdvisorMode::Working {
+            return;
+        }
+        let current_prompt = self.prompts.read_class(class);
+        let meta = self.prompts.render_adjust_meta(&[
+            ("class", &class.to_string()),
+            ("task", context),
+            ("primary_output", primary_output),
+            ("advisor_output", advisor_output),
+            ("current_prompt", &current_prompt),
+        ]);
+        let Some(advisor) = self.advisor.as_mut() else {
+            return;
+        };
+        let response = advisor.chat(
+            "You are minipaw's offline coach.",
+            &[ChatMessage::user(meta)],
+        );
+        let Some(directive) = parse_directive(class, &response) else {
+            println!(
+                "advisor adjust task={task_id} class={class} parsed=none raw={:?}",
+                cap(&response, 160)
+            );
+            return;
+        };
+        if matches!(directive, AdjustmentDirective::NoChange) {
+            println!("advisor adjust task={task_id} class={class} kind=no-change");
+            return;
+        }
+        if let AdjustmentDirective::RuleAppend { class, .. } = &directive {
+            // Cap how many auto-appended rules can accumulate per class so an
+            // overzealous advisor cannot bloat the system prompt indefinitely.
+            let existing = self.prompts.read_class(*class);
+            let count = existing
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
+                        && trimmed.contains(". ")
+                })
+                .count();
+            if count >= MAX_RULE_APPENDS_PER_CLASS {
+                println!(
+                    "advisor adjust task={task_id} class={class} skipped: rule cap reached"
+                );
+                return;
+            }
+        }
+        let workspace = self.prompts.workspace().to_owned();
+        match self.advisor_mode {
+            AdvisorMode::Training => match apply_training(&workspace, &self.prompts, &directive) {
+                Ok(outcome) => {
+                    println!(
+                        "advisor adjust task={task_id} mode=training applied: {outcome}"
+                    );
+                    let body = format!("[advisor adjust applied] {}", directive.summary());
+                    self.memory.append_message(task_id, "advisor-adjust", &body);
+                    if matches!(directive, AdjustmentDirective::SkillNew { .. }) {
+                        // Re-load skills so the new file is visible to subsequent tasks.
+                        self.skills =
+                            SkillRegistry::load(&workspace.join("skills"));
+                    }
+                }
+                Err(err) => eprintln!("advisor adjust apply failed: {err}"),
+            },
+            AdvisorMode::Trial => match write_proposal(&workspace, task_id, &directive) {
+                Ok(path) => {
+                    println!(
+                        "advisor adjust task={task_id} mode=trial proposal={}",
+                        path.display()
+                    );
+                    let body = format!(
+                        "[advisor proposal] {} → {}",
+                        directive.summary(),
+                        path.display()
+                    );
+                    self.memory.append_message(task_id, "advisor-adjust", &body);
+                }
+                Err(err) => eprintln!("advisor adjust proposal failed: {err}"),
+            },
+            AdvisorMode::Working => {}
+        }
+    }
+
+    fn run_shadow_query(&mut self, context: &str, target: AgentChoice) -> Option<String> {
+        let system = "You are a shadow advisor. Provide your best single-turn answer to the task below; do not request tools or further input.";
+        let messages = [ChatMessage::user(context.to_owned())];
+        let response = match target {
+            AgentChoice::Primary => self.llm.chat(system, &messages),
+            AgentChoice::Advisor => self.advisor.as_mut()?.chat(system, &messages),
+        };
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    }
+
+    fn record_divergence(&mut self, task_id: TaskId, record: &DivergenceRecord) {
+        let body = record.render();
+        println!(
+            "advisor divergence task={task_id} class={} verdict={:?} similarity={:.2}",
+            record.class, record.verdict, record.similarity
+        );
+        self.memory.append_message(task_id, "advisor-shadow", &body);
     }
 
     fn assemble_context(&self, msg: &IncomingMessage) -> (Option<TaskId>, String) {
@@ -176,41 +430,31 @@ impl MiniCore {
         input: &str,
         context: &str,
         class: MessageClass,
+        llm: &mut dyn LlmClient,
     ) -> (String, usize) {
         match class {
-            MessageClass::MiniHow => self.run_minihow(task_id, input, context),
-            MessageClass::MiniWhy => self.run_miniwhy(task_id, context),
-            MessageClass::MiniWhat => self.run_miniwhat(task_id, context),
+            MessageClass::MiniHow => self.run_minihow(task_id, input, context, llm),
+            MessageClass::MiniWhy => self.run_miniwhy(task_id, context, llm),
+            MessageClass::MiniWhat => self.run_miniwhat(task_id, context, llm),
         }
     }
 
     // MiniHow: execution task — proper multi-turn conversation with EXEC/DONE directives.
-    fn run_minihow(&mut self, task_id: TaskId, input: &str, context: &str) -> (String, usize) {
+    fn run_minihow(
+        &mut self,
+        task_id: TaskId,
+        input: &str,
+        context: &str,
+        llm: &mut dyn LlmClient,
+    ) -> (String, usize) {
         let workspace = self.tools.policy().workspace.display().to_string();
-        let system = format!(
-            "{SOUL}\n\n\
-             OS: {}\nWorkspace: {workspace}\n\n\
-             Your response MUST start with one of these directives on the very first line — \
-             no explanation, no preamble, no reasoning before it:\n\
-             EXEC: <shell command>   — run a shell command or calculation\n\
-             DONE: <final answer>    — task complete, report result\n\n\
-             Rules:\n\
-             1. NEVER compute arithmetic yourself — use EXEC: python3 -c \"print(expr)\" for all math.\n\
-             2. When reading a file, use EXEC: cat <path> or python3 -c \"print(int(open('<path>').read().strip()) + N)\".\n\
-             3. ALWAYS cast file contents to int before arithmetic: int(open(path).read().strip()).\n\
-             4. Do NOT issue DONE until EVERY requested step has been executed and its result appears in the conversation.\n\
-             5. If EXEC is denied, try an alternative. Only give up when no alternative exists.\n\
-             6. Put EXEC: or DONE: on line 1. Never write text before the directive.\n\
-             7. Every EXEC: command MUST fit on a single line — no newlines inside the command. \
-             Chain Python statements with semicolons: python3 -c \"stmt1; stmt2; stmt3\". \
-             NEVER use heredocs or multi-line python3 -c strings — only the first line is read.\n\
-             8. When a computation involves multiple distinct quantities, print each one \
-             on its own labeled line before printing the combined result, e.g.: \
-             python3 -c \"h=16; ts=1234; print(f'hour={{h}} ts={{ts}} total={{ts+h}}')\". \
-             This makes every intermediate value traceable.\n\
-             9. In DONE, only cite numbers that explicitly appeared in prior EXEC output. \
-             Do not reconstruct arithmetic from memory — re-read the EXEC results above.",
-            self.os_info
+        let system = self.prompts.render(
+            MessageClass::MiniHow,
+            &[
+                ("soul", SOUL),
+                ("os", &self.os_info),
+                ("workspace", &workspace),
+            ],
         );
 
         // The first user message carries session context (prior turns) if present,
@@ -228,7 +472,7 @@ impl MiniCore {
 
         for _ in 0..MAX_SESSION_STEPS {
             steps += 1;
-            let response = self.llm.chat(&system, &messages);
+            let response = llm.chat(&system, &messages);
 
             // Scan the first few lines for a directive so preamble text before
             // the command doesn't prevent it from being found.
@@ -303,13 +547,15 @@ impl MiniCore {
     }
 
     // MiniWhy: analysis task — LLM reasons, may request memory data via DATA: directive.
-    fn run_miniwhy(&mut self, task_id: TaskId, context: &str) -> (String, usize) {
-        let system = format!(
-            "{SOUL}\n\n\
-             You are an analysis advisor. Analyze the context and provide insights.\n\
-             To fetch more data, respond with DATA: <query> on the first line.\n\
-             Otherwise provide your analysis directly."
-        );
+    fn run_miniwhy(
+        &mut self,
+        task_id: TaskId,
+        context: &str,
+        llm: &mut dyn LlmClient,
+    ) -> (String, usize) {
+        let system = self
+            .prompts
+            .render(MessageClass::MiniWhy, &[("soul", SOUL)]);
 
         let mut messages = vec![ChatMessage::user(context.to_owned())];
         let mut steps = 0;
@@ -317,7 +563,7 @@ impl MiniCore {
         for _ in 0..MAX_SESSION_STEPS {
             steps += 1;
             println!("miniwhy step={steps} task={task_id}");
-            let response = self.llm.chat(&system, &messages);
+            let response = llm.chat(&system, &messages);
             let first_line = response.lines().next().unwrap_or("").trim().to_owned();
 
             if let Some(query) = first_line.strip_prefix("DATA:") {
@@ -360,7 +606,12 @@ impl MiniCore {
     }
 
     // MiniWhat: query task — single LLM call with SOUL + memory context in the system prompt.
-    fn run_miniwhat(&mut self, task_id: TaskId, context: &str) -> (String, usize) {
+    fn run_miniwhat(
+        &mut self,
+        task_id: TaskId,
+        context: &str,
+        llm: &mut dyn LlmClient,
+    ) -> (String, usize) {
         println!("miniwhat task={task_id}");
         let memory = self.memory.progressive_memory(
             context,
@@ -368,16 +619,12 @@ impl MiniCore {
             MEMORY_DETAIL_LIMIT,
             MEMORY_DETAIL_BYTES,
         );
-        let system = format!(
-            "{SOUL}\n\n\
-             You are a query advisor. Answer the question concisely.\n\
-             If your answer may be incomplete, outdated, or based on uncertain \
-             knowledge, say so explicitly at the start of your response.\n\
-             {}",
-            memory.render()
+        let system = self.prompts.render(
+            MessageClass::MiniWhat,
+            &[("soul", SOUL), ("memory", &memory.render())],
         );
 
-        let response = self.llm.chat(&system, &[ChatMessage::user(context.to_owned())]);
+        let response = llm.chat(&system, &[ChatMessage::user(context.to_owned())]);
         let output = response.trim().to_owned();
         self.memory.append_message(task_id, "advisor", &output);
         (output, 1)
@@ -424,6 +671,17 @@ fn data_query_is_safe(query: &str) -> bool {
         && !query.starts_with('/')
         && !query.contains(">>")
         && !query.contains('<')
+}
+
+fn cap(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.replace('\n', "↵");
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", text[..end].replace('\n', "↵"))
 }
 
 fn detect_os_info() -> String {
