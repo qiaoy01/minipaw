@@ -357,7 +357,7 @@ impl App {
             _ => {
                 eprintln!(
                     "usage: minipaw config advisor set --provider p --url u --model m [--api-key k]\n\
-                     \x20      config advisor mode <training|trial|working>\n\
+                     \x20      config advisor mode <training|trial|work>\n\
                      \x20      config advisor route <minihow|miniwhy|miniwhat> <primary|advisor>\n\
                      \x20      config advisor proposals list | show <id> | apply <id> | reject <id>\n\
                      \x20      config advisor show\n\
@@ -567,11 +567,11 @@ impl App {
 
     fn config_advisor_mode(&self, args: &[String]) -> io::Result<i32> {
         let Some(raw) = args.first() else {
-            eprintln!("usage: minipaw config advisor mode <training|trial|working>");
+            eprintln!("usage: minipaw config advisor mode <training|trial|work>");
             return Ok(2);
         };
         let Some(mode) = AdvisorMode::parse(raw) else {
-            eprintln!("unknown advisor mode: {raw} (expected training|trial|working)");
+            eprintln!("unknown advisor mode: {raw} (expected training|trial|work)");
             return Ok(2);
         };
         match write_advisor_mode(&self.workspace, mode) {

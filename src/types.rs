@@ -86,7 +86,7 @@ pub enum AdvisorMode {
     /// Route per message class; shadow the unselected model for divergence data.
     Trial,
     /// Route per message class; do not shadow.
-    Working,
+    Work,
 }
 
 impl fmt::Display for AdvisorMode {
@@ -94,7 +94,7 @@ impl fmt::Display for AdvisorMode {
         match self {
             Self::Training => f.write_str("training"),
             Self::Trial => f.write_str("trial"),
-            Self::Working => f.write_str("working"),
+            Self::Work => f.write_str("work"),
         }
     }
 }
@@ -104,7 +104,7 @@ impl AdvisorMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "training" | "train" => Some(Self::Training),
             "trial" => Some(Self::Trial),
-            "working" | "work" => Some(Self::Working),
+            "work" | "working" => Some(Self::Work),
             _ => None,
         }
     }

@@ -59,7 +59,7 @@ impl MiniCore {
             memory,
             llm,
             advisor: None,
-            advisor_mode: AdvisorMode::Working,
+            advisor_mode: AdvisorMode::Work,
             routing: std::collections::BTreeMap::new(),
             os_info: detect_os_info(),
             tools,
@@ -198,7 +198,7 @@ impl MiniCore {
         match self.advisor_mode {
             // In training the advisor is the trusted teacher; primary is shadowed.
             AdvisorMode::Training => AgentChoice::Advisor,
-            AdvisorMode::Trial | AdvisorMode::Working => self
+            AdvisorMode::Trial | AdvisorMode::Work => self
                 .routing
                 .get(&class)
                 .copied()
@@ -212,8 +212,8 @@ impl MiniCore {
         }
         match self.advisor_mode {
             AdvisorMode::Training | AdvisorMode::Trial => true,
-            // Working mode: route deterministically, do not shadow.
-            AdvisorMode::Working => {
+            // Work mode: route deterministically, do not shadow.
+            AdvisorMode::Work => {
                 let _ = executor;
                 false
             }
@@ -287,7 +287,7 @@ impl MiniCore {
         if self.advisor.is_none() {
             return;
         }
-        if self.advisor_mode == AdvisorMode::Working {
+        if self.advisor_mode == AdvisorMode::Work {
             return;
         }
         let current_prompt = self.prompts.read_class(class);
@@ -370,7 +370,7 @@ impl MiniCore {
                 }
                 Err(err) => eprintln!("advisor adjust proposal failed: {err}"),
             },
-            AdvisorMode::Working => {}
+            AdvisorMode::Work => {}
         }
     }
 

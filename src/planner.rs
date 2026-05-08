@@ -473,7 +473,7 @@ pub fn help_text() -> String {
         "config telegram unpair <id> remove one Telegram chat",
         "config telegram show        show Telegram bot config",
         "config advisor set ...      configure advisor LLM (large remote model)",
-        "config advisor mode <m>     training | trial | working",
+        "config advisor mode <m>     training | trial | work",
         "config advisor route <c> <a>  route a message class to primary or advisor",
         "config advisor show         show advisor config",
         "config advisor clear        remove advisor config",
