@@ -268,10 +268,14 @@ impl MiniCore {
                     }
 
                     let result = self.dispatch_exec(cmd);
+                    let mut preview_end = result.len().min(120);
+                    while preview_end > 0 && !result.is_char_boundary(preview_end) {
+                        preview_end -= 1;
+                    }
                     println!(
                         "minihow step={steps} exec={cmd:?} ok={} out={:?}",
                         !result.starts_with("error:"),
-                        &result[..result.len().min(120)]
+                        &result[..preview_end]
                     );
 
                     self.memory.append_message(

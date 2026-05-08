@@ -1,7 +1,7 @@
-use std::process::Command;
 use std::time::Duration;
 
 use crate::config::LlmConfig;
+use crate::http;
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -50,22 +50,32 @@ pub struct LlamaCppClient {
     model: String,
     thinking: bool,
     timeout: Duration,
+    api_key: Option<String>,
 }
 
 impl LlamaCppClient {
     pub fn from_config(config: &LlmConfig) -> Result<Self, String> {
-        if config.provider != "llamacpp" {
-            return Err(format!("unsupported provider: {}", config.provider));
+        match config.provider.as_str() {
+            "llamacpp" | "deepseek" | "openai" => {}
+            other => return Err(format!("unsupported provider: {other}")),
+        }
+        let mut endpoint = HttpEndpoint::parse(&config.url)?;
+        if endpoint.base_path.is_empty() {
+            endpoint.base_path = "/v1".to_owned();
         }
         Ok(Self {
-            endpoint: HttpEndpoint::parse(&config.url)?,
+            endpoint,
             model: config.model.clone(),
             thinking: config.thinking,
             timeout: if config.thinking {
                 Duration::from_secs(300)
             } else {
-                Duration::from_secs(30)
+                Duration::from_secs(300)
             },
+            api_key: config
+                .api_key
+                .clone()
+                .filter(|key| !key.trim().is_empty()),
         })
     }
 
@@ -77,7 +87,7 @@ impl LlamaCppClient {
         let (temperature, max_tokens, thinking_flag) = if self.thinking {
             ("1.0", 16384, "true")
         } else {
-            ("0.2", 2048, "false")
+            ("0.2", 32768, "false")
         };
 
         // Build the messages JSON array.
@@ -138,33 +148,25 @@ impl LlamaCppClient {
     }
 
     fn post(&self, path: &str, body: &str) -> Result<String, String> {
-        if self.endpoint.scheme != "http" {
-            return Err("only plain http endpoints are supported in the minimal client".to_owned());
-        }
         let full_path = join_path(&self.endpoint.base_path, path);
-        let url = format!(
-            "{}://{}:{}{}",
-            self.endpoint.scheme, self.endpoint.host, self.endpoint.port, full_path
-        );
-        let output = Command::new("curl")
-            .arg("--fail")
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("--max-time")
-            .arg(self.timeout.as_secs().to_string())
-            .arg("-H")
-            .arg("Content-Type: application/json")
-            .arg("-d")
-            .arg(body)
-            .arg(url)
-            .output()
-            .map_err(|err| format!("curl llm request failed: {err}"))?;
-
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        let auth_header = self
+            .api_key
+            .as_ref()
+            .map(|key| format!("Bearer {key}"));
+        let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
+        if let Some(value) = auth_header.as_deref() {
+            headers.push(("Authorization", value));
         }
+        http::request(http::Request {
+            method: "POST",
+            scheme: &self.endpoint.scheme,
+            host: &self.endpoint.host,
+            port: self.endpoint.port,
+            path: &full_path,
+            headers: &headers,
+            body: body.as_bytes(),
+            timeout: self.timeout,
+        })
     }
 }
 
@@ -377,5 +379,24 @@ mod tests {
         let msgs = vec![ChatMessage::user("hello")];
         let resp = llm.chat("sys", &msgs);
         assert!(resp.contains("hello"));
+    }
+
+    #[test]
+    #[ignore]
+    fn deepseek_smoke_via_rustls() {
+        let api_key = std::env::var("MINIPAW_DEEPSEEK_KEY")
+            .expect("set MINIPAW_DEEPSEEK_KEY to run this network probe");
+        let cfg = LlmConfig {
+            provider: "deepseek".into(),
+            url: "https://api.deepseek.com".into(),
+            model: "deepseek-v4-flash".into(),
+            thinking: false,
+            api_key: Some(api_key),
+        };
+        let mut client = LlamaCppClient::from_config(&cfg).expect("from_config");
+        let reply = client.chat("Reply with the single word PONG.", &[ChatMessage::user("ping")]);
+        eprintln!("deepseek reply: {reply}");
+        assert!(!reply.trim().is_empty(), "empty reply");
+        assert!(!reply.starts_with("llm request failed"), "request failed: {reply}");
     }
 }

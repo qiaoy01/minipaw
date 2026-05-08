@@ -24,6 +24,7 @@ pub struct LlmConfig {
     pub url: String,
     pub model: String,
     pub thinking: bool,
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +106,7 @@ pub fn read_file_config(workspace: &std::path::Path) -> FileConfig {
             url: extract_json_string(primary, "url")?,
             model: extract_json_string(primary, "model")?,
             thinking: extract_json_bool(primary, "thinking").unwrap_or(false),
+            api_key: extract_json_string(primary, "api_key"),
         })
     });
 
@@ -130,11 +132,13 @@ pub fn write_primary_config(
 ) -> std::io::Result<()> {
     let mut file_config = read_file_config(workspace);
     let thinking = file_config.primary_agent.as_ref().map(|c| c.thinking).unwrap_or(false);
+    let api_key = file_config.primary_agent.as_ref().and_then(|c| c.api_key.clone());
     file_config.primary_agent = Some(LlmConfig {
         provider: provider.to_owned(),
         url: url.to_owned(),
         model: model.to_owned(),
         thinking,
+        api_key,
     });
 
     fs::write(
@@ -205,10 +209,21 @@ pub fn render_file_config(config: &FileConfig) -> String {
             "      \"url\": \"{}\",\n",
             json_escape(&primary.url)
         ));
-        out.push_str(&format!(
-            "      \"model\": \"{}\"\n",
-            json_escape(&primary.model)
-        ));
+        if let Some(api_key) = &primary.api_key {
+            out.push_str(&format!(
+                "      \"model\": \"{}\",\n",
+                json_escape(&primary.model)
+            ));
+            out.push_str(&format!(
+                "      \"api_key\": \"{}\"\n",
+                json_escape(api_key)
+            ));
+        } else {
+            out.push_str(&format!(
+                "      \"model\": \"{}\"\n",
+                json_escape(&primary.model)
+            ));
+        }
         out.push_str("    }\n");
         out.push_str("  }");
     }
@@ -250,6 +265,7 @@ fn env_llm_config() -> Option<LlmConfig> {
         thinking: env::var("MINIPAW_LLM_THINKING").is_ok_and(|v| {
             matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
         }),
+        api_key: env::var("MINIPAW_LLM_API_KEY").ok(),
     })
 }
 
@@ -429,6 +445,7 @@ mod tests {
                 url: "http://host/v1".into(),
                 model: "qwen9b".into(),
                 thinking: false,
+                api_key: None,
             }),
             telegram: Some(TelegramBotConfig {
                 token: "123:abc".into(),
