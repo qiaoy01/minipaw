@@ -4,9 +4,6 @@
 
 Minipaw 是双模型系统, 将小型LLM与大型"顾问"LLM 连接起来。三阶段架构——训练 → 试用 → 工作——逐步建立小模型独立处理与路由给顾问的明确边界。
 
-S: deepseek-v4-flash, sonnet4.6
-L: deepseek-v4-pro, opus4.7
-
 当前三类核心问题驱动本次研究：
 
 1. **小型 LLM 的幻觉问题** 
