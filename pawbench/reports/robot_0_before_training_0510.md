@@ -1,7 +1,7 @@
 # pawbench: minipaw + qwen9b multi-step tool-use benchmark
 
 - Run timestamp: full_run
-- Endpoint: http://<endpoint-ip>:14416/v1 (qwen9b)
+- Endpoint: http://127.0.0.1:8080/v1 (qwen9b)
 - Cases: 105
 - Pass: 32
 - Partial: 33
