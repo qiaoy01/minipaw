@@ -1484,7 +1484,7 @@ working memory > arguments > runtime).
 > stderr:
 > Traceback (most recent call last):
 >   File "<string>", line 14, in <module>
->     cpu_count = int(re.search(r'cpu_count=(d+)', subprocess.check_output(['python3', '<workspace>/pawbench/tools/paw.py', 'self_cpu_count']).decode().strip()).group(1))
+>     cpu_count = int(re.search(r'cpu_count=(d+)', subprocess.check_output(['python3', 'tools/paw.py', 'self_cpu_count']).decode().strip()).group(1))
 >                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 > AttributeError: 'NoneType' object has no attribute 'group'
 
@@ -1642,7 +1642,7 @@ working memory > arguments > runtime).
 > error: 
 > stderr:
 >   File "<string>", line 1
->     import math; import subprocess; targets = ['water', 'shelter', 'ridge', 'outpost', 'base']; deltas = []; for t in targets: route = subprocess.run(['python3', '<workspace>/pawbench/tools/paw.py', 'robot_map_route', t], capture_output=True, text=True).stdout; lines = route.split('
+>     import math; import subprocess; targets = ['water', 'shelter', 'ridge', 'outpost', 'base']; deltas = []; for t in targets: route = subprocess.run(['python3', 'tools/paw.py', 'robot_map_route', t], capture_output=True, text=True).stdout; lines = route.split('
 >                                                                                                                                                                                                                                                                                                           ^
 > SyntaxError: unterminated string literal (detected at line 1)
 
@@ -1867,7 +1867,7 @@ working memory > arguments > runtime).
 > error: 
 > stderr:
 >   File "<string>", line 1
->     import sys; sys.path.insert(0, '<workspace>/pawbench/tools'); import paw; funcs = [f for f in dir(paw) if not f.startswith('_')]; print('
+>     import sys; sys.path.insert(0, 'tools'); import paw; funcs = [f for f in dir(paw) if not f.startswith('_')]; print('
 >                                                                                                                                                             ^
 > SyntaxError: unterminated string literal (detected at line 1)
 
