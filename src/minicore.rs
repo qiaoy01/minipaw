@@ -11,7 +11,15 @@ use crate::skills::SkillRegistry;
 use crate::tools::ToolRunner;
 use crate::types::{AdvisorMode, AgentChoice, MessageClass, TaskId, TaskStatus};
 
-const MAX_SESSION_STEPS: usize = 16;
+const DEFAULT_MAX_SESSION_STEPS: usize = 16;
+
+fn max_session_steps() -> usize {
+    std::env::var("MINIPAW_MAX_SESSION_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_SESSION_STEPS)
+}
 const CONTEXT_MAX_BYTES: usize = 6144;
 const MEMORY_INDEX_LIMIT: usize = 12;
 const MEMORY_DETAIL_LIMIT: usize = 4;
@@ -448,12 +456,14 @@ impl MiniCore {
         llm: &mut dyn LlmClient,
     ) -> (String, usize) {
         let workspace = self.tools.policy().workspace.display().to_string();
+        let skills_index = self.skills.index_text();
         let system = self.prompts.render(
             MessageClass::MiniHow,
             &[
                 ("soul", SOUL),
                 ("os", &self.os_info),
                 ("workspace", &workspace),
+                ("skills", &skills_index),
             ],
         );
 
@@ -469,80 +479,102 @@ impl MiniCore {
         let mut steps = 0;
         let mut last_cmd: Option<String> = None;
         let mut last_result: Option<String> = None;
+        let max_steps = max_session_steps();
 
-        for _ in 0..MAX_SESSION_STEPS {
+        for _ in 0..max_steps {
             steps += 1;
             let response = llm.chat(&system, &messages);
 
-            // Scan the first few lines for a directive so preamble text before
-            // the command doesn't prevent it from being found.
-            let directive = response.lines().take(4).find_map(|line| {
-                let t = line.trim();
-                if t.starts_with("DONE:") || t.starts_with("EXEC:") {
-                    Some(t.to_owned())
-                } else {
-                    None
-                }
-            });
+            // Collect every EXEC: / DONE: directive in order — scan the full
+            // response so a model that preambles or batches multiple commands
+            // in a single turn still has all its directives honored. An EXEC:
+            // command is allowed to span multiple lines when its quoting is
+            // unbalanced on the first line (e.g. `EXEC: python3 -c "` followed
+            // by a multi-line script); the parser keeps appending lines until
+            // the quote balances or another directive is encountered.
+            let directives = collect_directives(&response);
 
-            if let Some(ref d) = directive {
+            if directives.is_empty() {
+                // Free-form response — treat as the final answer.
+                let output = response.trim().to_owned();
+                println!("minihow free-form task={task_id} steps={steps}");
+                messages.push(ChatMessage::assistant(response));
+                self.memory.append_message(task_id, "advisor", &output);
+                return (output, steps);
+            }
+
+            // Execute every EXEC in order until the first DONE (which terminates).
+            let mut combined = String::new();
+
+            for d in &directives {
                 if d.starts_with("DONE:") {
-                    // Capture everything after DONE: including subsequent lines,
-                    // since the LLM often puts the full answer on multiple lines.
                     let output = match response.find("DONE:") {
                         Some(pos) => response[pos + "DONE:".len()..].trim().to_owned(),
                         None => d["DONE:".len()..].trim().to_owned(),
                     };
                     println!("minihow done task={task_id} steps={steps}");
-                    messages.push(ChatMessage::assistant(response));
+                    messages.push(ChatMessage::assistant(response.clone()));
                     self.memory.append_message(task_id, "advisor", &output);
                     return (output, steps);
                 }
 
-                if let Some(cmd) = d.strip_prefix("EXEC:") {
-                    let cmd = cmd.trim();
+                let Some(cmd) = d.strip_prefix("EXEC:") else { continue };
+                let cmd = cmd.trim();
 
-                    // Loop detection: same command repeated — return last result.
-                    if last_cmd.as_deref() == Some(cmd) {
-                        if let Some(result) = last_result {
+                // Loop detection: identical to the most recent dispatched command.
+                if last_cmd.as_deref() == Some(cmd) {
+                    if let Some(result) = last_result.clone() {
+                        if combined.is_empty() {
+                            // Nothing executed this turn yet — return cached result.
                             let output = result.trim().to_owned();
                             self.memory.append_message(task_id, "advisor", &output);
                             return (output, steps);
                         }
+                        // Otherwise fold the cached result into the combined feedback
+                        // and stop executing further directives this turn so the LLM
+                        // can re-plan with the accumulated context.
+                        combined.push_str(&format!(
+                            "Result of `{cmd}` (cached, loop suppressed):\n{}\n\n",
+                            result
+                        ));
+                        break;
                     }
-
-                    let result = self.dispatch_exec(cmd);
-                    println!(
-                        "minihow step={steps} exec={cmd:?} ok={} out={:?}",
-                        !result.starts_with("error:"),
-                        &result[..result.len().min(120)]
-                    );
-
-                    self.memory.append_message(
-                        task_id,
-                        "exec",
-                        &format!("EXEC: {cmd}\nResult: {result}"),
-                    );
-
-                    messages.push(ChatMessage::assistant(response));
-                    messages.push(ChatMessage::user(format!("Result of `{cmd}`:\n{result}")));
-
-                    last_cmd = Some(cmd.to_owned());
-                    last_result = Some(result);
-                    continue;
                 }
+
+                let result = self.dispatch_exec(cmd);
+                println!(
+                    "minihow step={steps} exec={cmd:?} ok={} out={:?}",
+                    !result.starts_with("error:"),
+                    &result[..result.len().min(120)]
+                );
+
+                self.memory.append_message(
+                    task_id,
+                    "exec",
+                    &format!("EXEC: {cmd}\nResult: {result}"),
+                );
+
+                combined.push_str(&format!("Result of `{cmd}`:\n{result}\n\n"));
+
+                last_cmd = Some(cmd.to_owned());
+                last_result = Some(result);
             }
 
-            // No directive found — free-form response, treat as final answer.
-            let output = response.trim().to_owned();
-            println!("minihow free-form task={task_id} steps={steps}");
+            if combined.is_empty() {
+                // Directives were present but none was a real EXEC (e.g. malformed).
+                let output = response.trim().to_owned();
+                println!("minihow no-exec task={task_id} steps={steps}");
+                messages.push(ChatMessage::assistant(response));
+                self.memory.append_message(task_id, "advisor", &output);
+                return (output, steps);
+            }
+
             messages.push(ChatMessage::assistant(response));
-            self.memory.append_message(task_id, "advisor", &output);
-            return (output, steps);
+            messages.push(ChatMessage::user(combined.trim_end().to_owned()));
         }
 
         eprintln!("minihow step-limit task={task_id}");
-        let output = format!("Session reached step limit ({MAX_SESSION_STEPS}).");
+        let output = format!("Session reached step limit ({max_steps}).");
         (output, steps)
     }
 
@@ -559,8 +591,9 @@ impl MiniCore {
 
         let mut messages = vec![ChatMessage::user(context.to_owned())];
         let mut steps = 0;
+        let max_steps = max_session_steps();
 
-        for _ in 0..MAX_SESSION_STEPS {
+        for _ in 0..max_steps {
             steps += 1;
             println!("miniwhy step={steps} task={task_id}");
             let response = llm.chat(&system, &messages);
@@ -601,7 +634,7 @@ impl MiniCore {
         }
 
         eprintln!("miniwhy step-limit task={task_id}");
-        let output = format!("Analysis reached step limit ({MAX_SESSION_STEPS}).");
+        let output = format!("Analysis reached step limit ({max_steps}).");
         (output, steps)
     }
 
@@ -648,9 +681,11 @@ impl MiniCore {
                 return format!("error: no agent named '{name}'");
             }
         }
+        let resolved = self.resolve_skill_invocation(command);
+        let target = resolved.as_deref().unwrap_or(command);
         for agent in &self.agents {
             if agent.name() == "exec" {
-                return match agent.execute(command) {
+                return match agent.execute(target) {
                     Ok(out) => out,
                     Err(err) => format!("error: {err}"),
                 };
@@ -658,6 +693,101 @@ impl MiniCore {
         }
         "error: no exec agent registered".to_owned()
     }
+
+    /// When the LLM emits `EXEC: <skill-name> [args...]` instead of the full
+    /// exec command, swap the skill name for the registered exec line so the
+    /// tool runner receives a real shell command. Falls back to the original
+    /// string when the first token is not a known skill name.
+    fn resolve_skill_invocation(&self, command: &str) -> Option<String> {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (head, tail) = match trimmed.split_once(char::is_whitespace) {
+            Some((h, t)) => (h, t),
+            None => (trimmed, ""),
+        };
+        let skill = self.skills.find(head)?;
+        let exec = skill.exec.as_deref()?;
+        let result = if tail.is_empty() {
+            exec.to_owned()
+        } else {
+            format!("{exec} {tail}")
+        };
+        println!("minicore skill-resolve from={head:?} to={result:?}");
+        Some(result)
+    }
+}
+
+/// Collect EXEC: / DONE: directives from an LLM response in document order.
+/// An EXEC: directive may span multiple lines when its first line has
+/// unbalanced quotes — typical when the model writes
+///
+///     EXEC: python3 -c "
+///     import sys
+///     ...
+///     "
+///
+/// The collector keeps appending subsequent lines (joined by '\n') until the
+/// quoting balances or another directive line is reached. DONE: never spans
+/// multiple lines (everything after DONE: is the final answer payload).
+fn collect_directives(response: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let lines: Vec<&str> = response.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        if trimmed.starts_with("DONE:") {
+            out.push(trimmed.trim_end().to_owned());
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("EXEC:") {
+            // Re-take the substring without trimming the leading EXEC: so quote
+            // counting starts from the actual command body.
+            let mut buf = trimmed.to_owned();
+            let body_start = "EXEC:".len();
+            i += 1;
+            while quote_balance(&buf[body_start..]) != 0 && i < lines.len() {
+                let next_trimmed = lines[i].trim_start();
+                if next_trimmed.starts_with("EXEC:") || next_trimmed.starts_with("DONE:") {
+                    break;
+                }
+                buf.push('\n');
+                buf.push_str(lines[i]);
+                i += 1;
+            }
+            out.push(buf);
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Track unbalanced quote state ignoring backslash-escaped quote chars.
+/// Returns 0 when balanced, nonzero when an open quote of some kind remains.
+/// The exact nonzero value is opaque; callers should only check equality to 0.
+fn quote_balance(text: &str) -> i32 {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                // Skip the next character (escape) only when inside a double quote
+                // or a normal context. Single quotes don't process backslashes,
+                // but inside python -c "..." they often do.
+                if in_double {
+                    let _ = chars.next();
+                }
+            }
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+    }
+    (in_single as i32) + (in_double as i32)
 }
 
 /// Return true when a DATA: query looks like a plain memory/search string.

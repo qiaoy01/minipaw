@@ -42,13 +42,21 @@ impl SkillRegistry {
     }
 
     /// Compact index of skill names and descriptions for the LLM prompt.
+    /// When a skill has `exec:`, the line shows `EXEC: <command>` so the LLM
+    /// can copy it directly into its directive.
     pub fn index_text(&self) -> String {
         if self.skills.is_empty() {
             return String::new();
         }
-        let mut out = String::from("Available skills:\n");
+        let mut out = String::from("Available skills (invoke via the EXEC: directive):\n");
         for skill in &self.skills {
-            out.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            match &skill.exec {
+                Some(cmd) => out.push_str(&format!(
+                    "- {} — {}\n  EXEC: {}\n",
+                    skill.name, skill.description, cmd
+                )),
+                None => out.push_str(&format!("- {} — {}\n", skill.name, skill.description)),
+            }
         }
         out
     }
@@ -187,8 +195,9 @@ mod tests {
             ],
         };
         let text = registry.index_text();
-        assert!(text.contains("current-time: Get current date and time"));
-        assert!(text.contains("greet: Greet the user"));
+        assert!(text.contains("current-time — Get current date and time"));
+        assert!(text.contains("EXEC: date"));
+        assert!(text.contains("greet — Greet the user"));
     }
 
     #[test]
