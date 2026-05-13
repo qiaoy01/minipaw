@@ -5,4 +5,11 @@ minipaw.json
 todo.md
 test_report*.md
 .claude-saved-session
-docs/
+
+# Tree: runtime state and secrets must never be committed.
+# `minipaw.json` (line 4) globally matches the SJTU 致远一号 api_key file.
+# Per 余樵 2026-05-10 warning, do not commit secrets.
+robot_state/
+memory/
+__pycache__/
+*.pyc
