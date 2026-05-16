@@ -1,0 +1,9 @@
+{
+  "agents": {
+    "primary": {
+      "provider": "llamacpp",
+      "url": "http://localhost:8080/v1",
+      "model": "qwen9b"
+    }
+  }
+}
