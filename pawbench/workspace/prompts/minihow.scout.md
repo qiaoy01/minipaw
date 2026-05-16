@@ -1,1 +1,0 @@
-1. For scout tasks, always run: self_battery_level, robot_threat_radar, robot_move_turn 180, robot_move_forward 2, robot_threat_radar, self_battery_level, robot_comm_send 'threat detected', robot_comm_signal_strength; never skip steps even if no initial threat.
