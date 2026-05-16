@@ -10,11 +10,17 @@ use crate::channels::telegram::{
     get_updates, send_message, TelegramAdmission, TelegramChannel, TelegramConfig, TelegramMessage,
 };
 use crate::channels::telegram_agent::TelegramAgent;
+use crate::adjustments::{
+    apply_proposal, find_proposal, list_proposals, reject_proposal, ProposalEntry,
+};
 use crate::config::{
-    default_workspace, pair_telegram_chat, read_file_config, unpair_telegram_chat,
-    write_primary_config, write_telegram_config, AgentConfig,
+    clear_advisor, default_workspace, pair_telegram_chat, read_file_config, unpair_telegram_chat,
+    write_advisor_agent, write_advisor_mode, write_advisor_route, write_primary_config,
+    write_telegram_config, AgentConfig,
 };
 use crate::llm::{LlamaCppClient, LlmClient, OfflineLlm};
+use crate::prompts::PromptStore;
+use crate::types::{AdvisorMode, AgentChoice, MessageClass};
 use crate::memory::{InMemoryStore, MemoryStore};
 use crate::minicore::{IncomingMessage, MiniCore, SessionReport};
 use crate::planner::help_text;
@@ -85,8 +91,34 @@ impl App {
         let tools = ToolRunner::new(policy.clone());
         let memory = open_memory(&config);
         let llm = open_llm(&config);
+        let prompts = PromptStore::install(&config.workspace).unwrap_or_else(|err| {
+            eprintln!("prompt install failed, falling back to embedded defaults: {err}");
+            // Even on failure return a store rooted at workspace; render() falls
+            // back to compile-time defaults when the file is missing.
+            PromptStore::install(&config.workspace).unwrap_or_else(|_| {
+                PromptStore::install(std::path::Path::new("."))
+                    .expect("fallback prompt install must succeed")
+            })
+        });
 
-        let mut core = MiniCore::new(memory, llm, tools, skills);
+        let mut core = MiniCore::new(memory, llm, tools, skills, prompts);
+
+        if let Some(advisor) = &config.advisor {
+            match LlamaCppClient::from_config(&advisor.agent) {
+                Ok(client) => {
+                    println!(
+                        "advisor configured: provider={} model={} mode={}",
+                        advisor.agent.provider, advisor.agent.model, advisor.mode
+                    );
+                    core.set_advisor(
+                        Box::new(client),
+                        advisor.mode,
+                        advisor.routing.clone(),
+                    );
+                }
+                Err(err) => eprintln!("advisor disabled: {err}"),
+            }
+        }
 
         // Register built-in agents.
         core.register(Box::new(ExecAgent::new(policy)));
@@ -165,6 +197,7 @@ impl App {
                     text: input.to_owned(),
                     context_id: None,
                     source: "cli".to_owned(),
+                    subclass: None,
                 };
                 let report = self.core.process(msg);
                 writeln!(
@@ -182,7 +215,26 @@ impl App {
     fn task(&mut self, args: &[String]) -> io::Result<i32> {
         match args.first().map(String::as_str) {
             Some("new") => {
-                let input = args[1..].join(" ");
+                let mut subclass: Option<String> = None;
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut i = 1;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--subclass" => {
+                            let Some(val) = args.get(i + 1) else {
+                                eprintln!("--subclass requires a value");
+                                return Ok(2);
+                            };
+                            subclass = Some(val.clone());
+                            i += 2;
+                        }
+                        other => {
+                            text_parts.push(other.to_owned());
+                            i += 1;
+                        }
+                    }
+                }
+                let input = text_parts.join(" ");
                 if input.trim().is_empty() {
                     eprintln!("task new requires text");
                     return Ok(2);
@@ -191,6 +243,7 @@ impl App {
                     text: input,
                     context_id: None,
                     source: "cli".to_owned(),
+                    subclass,
                 };
                 let report = self.core.process(msg);
                 println!(
@@ -261,14 +314,411 @@ impl App {
                 println!("config ok");
                 Ok(0)
             }
+            Some("set") => self.config_set(&args[1..]),
+            Some("show") => self.config_show(),
             Some("telegram") => self.config_telegram(&args[1..]),
+            Some("advisor") => self.config_advisor(&args[1..]),
             _ => {
                 eprintln!(
-                    "usage: minipaw config check | config telegram set --token <token> --chats <ids> | config telegram pair <chat-id> | config telegram unpair <chat-id> | config telegram show"
+                    "usage: minipaw config check | config show | config set [--provider p] [--url u] [--model m] [--api-key k] | config telegram ... | config advisor ..."
                 );
                 Ok(2)
             }
         }
+    }
+
+    fn config_show(&self) -> io::Result<i32> {
+        let file_config = read_file_config(&self.workspace);
+        if let Some(llm) = &file_config.primary_agent {
+            println!("provider={}", llm.provider);
+            println!("url={}", llm.url);
+            println!("model={}", llm.model);
+            if llm.api_key.as_ref().is_some_and(|k| !k.is_empty()) {
+                println!("api_key=<set>");
+            }
+        } else {
+            println!("model: not configured");
+        }
+        if let Some(advisor) = &file_config.advisor {
+            println!("advisor.provider={}", advisor.agent.provider);
+            println!("advisor.url={}", advisor.agent.url);
+            println!("advisor.model={}", advisor.agent.model);
+            if advisor.agent.api_key.as_ref().is_some_and(|k| !k.is_empty()) {
+                println!("advisor.api_key=<set>");
+            }
+            println!("advisor.mode={}", advisor.mode);
+            for class in [
+                MessageClass::MiniHow,
+                MessageClass::MiniWhy,
+                MessageClass::MiniWhat,
+            ] {
+                let choice = advisor
+                    .routing
+                    .get(&class)
+                    .copied()
+                    .unwrap_or(AgentChoice::Primary);
+                println!("advisor.routing.{class}={choice}");
+            }
+        }
+        if let Some(telegram) = &file_config.telegram {
+            println!("telegram.token={}", mask_token(&telegram.token));
+            println!("telegram.chats={}", join_chat_ids(&telegram.allowed_chats));
+        }
+        Ok(0)
+    }
+
+    fn config_advisor(&self, args: &[String]) -> io::Result<i32> {
+        match args.first().map(String::as_str) {
+            Some("set") => self.config_advisor_set(&args[1..]),
+            Some("show") => self.config_advisor_show(),
+            Some("mode") => self.config_advisor_mode(&args[1..]),
+            Some("route") => self.config_advisor_route(&args[1..]),
+            Some("clear") => self.config_advisor_clear(),
+            Some("proposals") => self.config_advisor_proposals(&args[1..]),
+            _ => {
+                eprintln!(
+                    "usage: minipaw config advisor set --provider p --url u --model m [--api-key k]\n\
+                     \x20      config advisor mode <training|trial|work>\n\
+                     \x20      config advisor route <minihow|miniwhy|miniwhat> <primary|advisor>\n\
+                     \x20      config advisor proposals list | show <id> | apply <id> | reject <id>\n\
+                     \x20      config advisor show\n\
+                     \x20      config advisor clear"
+                );
+                Ok(2)
+            }
+        }
+    }
+
+    fn config_advisor_proposals(&self, args: &[String]) -> io::Result<i32> {
+        match args.first().map(String::as_str) {
+            Some("list") | None => {
+                let proposals = list_proposals(&self.workspace);
+                if proposals.is_empty() {
+                    println!("no advisor proposals pending");
+                    return Ok(0);
+                }
+                for p in proposals {
+                    println!(
+                        "{} kind={} {}",
+                        p.id,
+                        p.kind,
+                        proposal_summary(&p)
+                    );
+                }
+                Ok(0)
+            }
+            Some("show") => {
+                let Some(id) = args.get(1) else {
+                    eprintln!("usage: minipaw config advisor proposals show <id>");
+                    return Ok(2);
+                };
+                let Some(proposal) = find_proposal(&self.workspace, id) else {
+                    eprintln!("proposal not found: {id}");
+                    return Ok(2);
+                };
+                println!("id: {}", proposal.id);
+                println!("kind: {}", proposal.kind);
+                if let Some(class) = proposal.class {
+                    println!("class: {class}");
+                }
+                if let Some(task) = proposal.task_id {
+                    println!("task: {task}");
+                }
+                println!("created_at: {}", proposal.created_at);
+                println!("---");
+                println!("{}", proposal.body);
+                Ok(0)
+            }
+            Some("apply") => {
+                let Some(id) = args.get(1) else {
+                    eprintln!("usage: minipaw config advisor proposals apply <id>");
+                    return Ok(2);
+                };
+                let Some(proposal) = find_proposal(&self.workspace, id) else {
+                    eprintln!("proposal not found: {id}");
+                    return Ok(2);
+                };
+                let prompts = match PromptStore::install(&self.workspace) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        eprintln!("prompt store unavailable: {err}");
+                        return Ok(2);
+                    }
+                };
+                match apply_proposal(&self.workspace, &prompts, &proposal) {
+                    Ok(outcome) => {
+                        println!("applied {id}: {outcome}");
+                        Ok(0)
+                    }
+                    Err(err) => {
+                        eprintln!("apply failed: {err}");
+                        Ok(2)
+                    }
+                }
+            }
+            Some("reject") => {
+                let Some(id) = args.get(1) else {
+                    eprintln!("usage: minipaw config advisor proposals reject <id>");
+                    return Ok(2);
+                };
+                let Some(proposal) = find_proposal(&self.workspace, id) else {
+                    eprintln!("proposal not found: {id}");
+                    return Ok(2);
+                };
+                match reject_proposal(&proposal) {
+                    Ok(()) => {
+                        println!("rejected {id}");
+                        Ok(0)
+                    }
+                    Err(err) => {
+                        eprintln!("reject failed: {err}");
+                        Ok(2)
+                    }
+                }
+            }
+            Some(other) => {
+                eprintln!("unknown proposals subcommand: {other}");
+                Ok(2)
+            }
+        }
+    }
+
+    fn config_advisor_set(&self, args: &[String]) -> io::Result<i32> {
+        let file_config = read_file_config(&self.workspace);
+        let current = file_config.advisor.as_ref().map(|a| &a.agent);
+        let mut provider = current
+            .map(|c| c.provider.clone())
+            .unwrap_or_else(|| "deepseek".to_owned());
+        let mut url = current
+            .map(|c| c.url.clone())
+            .unwrap_or_else(|| "https://api.deepseek.com/v1".to_owned());
+        let mut model = current
+            .map(|c| c.model.clone())
+            .unwrap_or_else(|| "deepseek-chat".to_owned());
+        let mut api_key: Option<String> = current.and_then(|c| c.api_key.clone());
+        let mut clear_key = false;
+
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--provider" => {
+                    let Some(val) = args.get(index + 1) else {
+                        eprintln!("--provider requires a value");
+                        return Ok(2);
+                    };
+                    provider = val.clone();
+                    index += 2;
+                }
+                "--url" => {
+                    let Some(val) = args.get(index + 1) else {
+                        eprintln!("--url requires a value");
+                        return Ok(2);
+                    };
+                    url = val.clone();
+                    index += 2;
+                }
+                "--model" => {
+                    let Some(val) = args.get(index + 1) else {
+                        eprintln!("--model requires a value");
+                        return Ok(2);
+                    };
+                    model = val.clone();
+                    index += 2;
+                }
+                "--api-key" => {
+                    let Some(val) = args.get(index + 1) else {
+                        eprintln!("--api-key requires a value");
+                        return Ok(2);
+                    };
+                    if val.is_empty() {
+                        clear_key = true;
+                    } else {
+                        api_key = Some(val.clone());
+                    }
+                    index += 2;
+                }
+                unknown => {
+                    eprintln!("unknown advisor set option: {unknown}");
+                    return Ok(2);
+                }
+            }
+        }
+
+        if clear_key {
+            api_key = None;
+        }
+
+        write_advisor_agent(&self.workspace, &provider, &url, &model, api_key.as_deref())?;
+        println!("advisor.provider={provider}");
+        println!("advisor.url={url}");
+        println!("advisor.model={model}");
+        if api_key.is_some() {
+            println!("advisor.api_key=<set>");
+        }
+        Ok(0)
+    }
+
+    fn config_advisor_show(&self) -> io::Result<i32> {
+        let file_config = read_file_config(&self.workspace);
+        let Some(advisor) = file_config.advisor else {
+            println!("advisor: not configured");
+            return Ok(0);
+        };
+        println!("advisor.provider={}", advisor.agent.provider);
+        println!("advisor.url={}", advisor.agent.url);
+        println!("advisor.model={}", advisor.agent.model);
+        if advisor.agent.api_key.as_ref().is_some_and(|k| !k.is_empty()) {
+            println!("advisor.api_key=<set>");
+        }
+        println!("advisor.mode={}", advisor.mode);
+        for class in [
+            MessageClass::MiniHow,
+            MessageClass::MiniWhy,
+            MessageClass::MiniWhat,
+        ] {
+            let choice = advisor
+                .routing
+                .get(&class)
+                .copied()
+                .unwrap_or(AgentChoice::Primary);
+            println!("advisor.routing.{class}={choice}");
+        }
+        Ok(0)
+    }
+
+    fn config_advisor_mode(&self, args: &[String]) -> io::Result<i32> {
+        let Some(raw) = args.first() else {
+            eprintln!("usage: minipaw config advisor mode <training|trial|work>");
+            return Ok(2);
+        };
+        let Some(mode) = AdvisorMode::parse(raw) else {
+            eprintln!("unknown advisor mode: {raw} (expected training|trial|work)");
+            return Ok(2);
+        };
+        match write_advisor_mode(&self.workspace, mode) {
+            Ok(()) => {
+                println!("advisor.mode={mode}");
+                Ok(0)
+            }
+            Err(err) => {
+                eprintln!("advisor mode update failed: {err}");
+                Ok(2)
+            }
+        }
+    }
+
+    fn config_advisor_route(&self, args: &[String]) -> io::Result<i32> {
+        let (Some(class_raw), Some(choice_raw)) = (args.first(), args.get(1)) else {
+            eprintln!(
+                "usage: minipaw config advisor route <minihow|miniwhy|miniwhat> <primary|advisor>"
+            );
+            return Ok(2);
+        };
+        let Some(class) = MessageClass::parse(class_raw) else {
+            eprintln!("unknown message class: {class_raw}");
+            return Ok(2);
+        };
+        let Some(choice) = AgentChoice::parse(choice_raw) else {
+            eprintln!("unknown agent choice: {choice_raw}");
+            return Ok(2);
+        };
+        match write_advisor_route(&self.workspace, class, choice) {
+            Ok(()) => {
+                println!("advisor.routing.{class}={choice}");
+                Ok(0)
+            }
+            Err(err) => {
+                eprintln!("advisor route update failed: {err}");
+                Ok(2)
+            }
+        }
+    }
+
+    fn config_advisor_clear(&self) -> io::Result<i32> {
+        clear_advisor(&self.workspace)?;
+        println!("advisor cleared");
+        Ok(0)
+    }
+
+    fn config_set(&self, args: &[String]) -> io::Result<i32> {
+        let file_config = read_file_config(&self.workspace);
+        let current = file_config.primary_agent.as_ref();
+        let mut provider =
+            current.map(|c| c.provider.clone()).unwrap_or_else(|| "llamacpp".to_owned());
+        let mut url = current
+            .map(|c| c.url.clone())
+            .unwrap_or_else(|| "http://127.0.0.1:8080/v1".to_owned());
+        let mut model =
+            current.map(|c| c.model.clone()).unwrap_or_else(|| "local-model".to_owned());
+        let mut api_key: Option<String> = current.and_then(|c| c.api_key.clone());
+        let mut clear_key = false;
+
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--provider" => {
+                    let Some(val) = args.get(index + 1) else {
+                        eprintln!("--provider requires a value");
+                        return Ok(2);
+                    };
+                    provider = val.clone();
+                    index += 2;
+                }
+                "--url" => {
+                    let Some(val) = args.get(index + 1) else {
+                        eprintln!("--url requires a value");
+                        return Ok(2);
+                    };
+                    url = val.clone();
+                    index += 2;
+                }
+                "--model" => {
+                    let Some(val) = args.get(index + 1) else {
+                        eprintln!("--model requires a value");
+                        return Ok(2);
+                    };
+                    model = val.clone();
+                    index += 2;
+                }
+                "--api-key" => {
+                    let Some(val) = args.get(index + 1) else {
+                        eprintln!("--api-key requires a value");
+                        return Ok(2);
+                    };
+                    if val.is_empty() {
+                        clear_key = true;
+                    } else {
+                        api_key = Some(val.clone());
+                    }
+                    index += 2;
+                }
+                "--help" | "-h" => {
+                    eprintln!(
+                        "usage: minipaw config set [--provider p] [--url u] [--model m] [--api-key k]\n\
+                         Updates model config in minipaw.json; unspecified fields keep their current values.\n\
+                         Use --api-key \"\" to remove the api key."
+                    );
+                    return Ok(0);
+                }
+                unknown => {
+                    eprintln!("unknown config set option: {unknown}");
+                    return Ok(2);
+                }
+            }
+        }
+
+        if clear_key {
+            api_key = None;
+        }
+
+        write_primary_config(&self.workspace, &provider, &url, &model, api_key.as_deref())?;
+        println!("provider={provider}");
+        println!("url={url}");
+        println!("model={model}");
+        if api_key.is_some() {
+            println!("api_key=<set>");
+        }
+        Ok(0)
     }
 
     fn gateway(&mut self, args: &[String]) -> io::Result<i32> {
@@ -553,6 +1003,7 @@ impl App {
                     text,
                     context_id: Some(chat_id.to_string()),
                     source: "telegram".to_owned(),
+                    subclass: None,
                 };
                 let report = self.core.process(msg);
                 let reply = format_session_report(&report);
@@ -621,6 +1072,7 @@ impl App {
             text: routed,
             context_id: Some(session_key.to_owned()),
             source: "agent".to_owned(),
+            subclass: None,
         };
         let report = self.core.process(msg);
         print_gateway_event(
@@ -644,15 +1096,29 @@ impl App {
         let default_provider = current
             .map(|llm| llm.provider.as_str())
             .unwrap_or("llamacpp");
-        let default_url = current
-            .map(|llm| llm.url.as_str())
-            .unwrap_or("http://127.0.0.1:8080/v1");
-        let default_model = current.map(|llm| llm.model.as_str()).unwrap_or("local-model");
 
-        let provider = prompt_default("model provider", default_provider)?;
-        let url = prompt_default("model url", default_url)?;
-        let model = prompt_default("model name", default_model)?;
-        write_primary_config(&self.workspace, &provider, &url, &model)?;
+        let provider = prompt_default("model provider (llamacpp/deepseek)", default_provider)?;
+        let provider_str = provider.trim();
+        let url_default = current
+            .map(|llm| llm.url.as_str())
+            .unwrap_or(if provider_str == "deepseek" {
+                "https://api.deepseek.com/v1"
+            } else {
+                "http://127.0.0.1:8080/v1"
+            });
+        let model_default = current
+            .map(|llm| llm.model.as_str())
+            .unwrap_or(if provider_str == "deepseek" { "deepseek-chat" } else { "local-model" });
+        let url = prompt_default("model url", url_default)?;
+        let model = prompt_default("model name", model_default)?;
+        let api_key = if matches!(provider_str, "deepseek" | "openai") {
+            let key_default = current.and_then(|llm| llm.api_key.as_deref()).unwrap_or("");
+            let key = prompt_default("api key", key_default)?;
+            if key.trim().is_empty() { None } else { Some(key.trim().to_owned()) }
+        } else {
+            current.and_then(|llm| llm.api_key.clone())
+        };
+        write_primary_config(&self.workspace, &provider, &url, &model, api_key.as_deref())?;
         println!("model configured: provider={provider} model={model}");
 
         let channel = prompt_default("channel (none/telegram)", "none")?;
@@ -845,6 +1311,7 @@ impl App {
                                     text,
                                     context_id: Some(chat_id.to_string()),
                                     source: "telegram".to_owned(),
+                                    subclass: None,
                                 };
                                 let report = self.core.process(msg);
                                 let reply = format_session_report(&report);
@@ -1068,6 +1535,26 @@ fn parse_task_id(value: &str) -> Option<crate::types::TaskId> {
         .parse::<u64>()
         .ok()
         .map(crate::types::TaskId)
+}
+
+fn proposal_summary(p: &ProposalEntry) -> String {
+    let body = p.body.trim();
+    let snippet = body.lines().next().unwrap_or("").trim();
+    let mut head = String::new();
+    if let Some(class) = p.class {
+        head.push_str(&format!("[{class}] "));
+    }
+    if snippet.len() > 100 {
+        let mut end = 100;
+        while !snippet.is_char_boundary(end) {
+            end -= 1;
+        }
+        head.push_str(&snippet[..end]);
+        head.push('…');
+    } else {
+        head.push_str(snippet);
+    }
+    head
 }
 
 fn parse_chat_ids(value: &str) -> std::collections::BTreeSet<i64> {

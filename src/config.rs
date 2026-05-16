@@ -1,8 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::types::{AdvisorMode, AgentChoice, MessageClass};
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -16,6 +18,7 @@ pub struct AgentConfig {
     pub telegram_token: Option<String>,
     pub telegram_allowed_chats: BTreeSet<i64>,
     pub primary_agent: Option<LlmConfig>,
+    pub advisor: Option<AdvisorConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +26,34 @@ pub struct LlmConfig {
     pub provider: String,
     pub url: String,
     pub model: String,
-    pub thinking: bool,
     pub api_key: Option<String>,
+    pub thinking: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvisorConfig {
+    pub mode: AdvisorMode,
+    pub agent: LlmConfig,
+    pub routing: BTreeMap<MessageClass, AgentChoice>,
+}
+
+impl AdvisorConfig {
+    pub fn new(agent: LlmConfig) -> Self {
+        Self {
+            mode: AdvisorMode::Trial,
+            agent,
+            routing: BTreeMap::new(),
+        }
+    }
+
+    /// Return the agent that should serve this message class, defaulting to
+    /// `Primary` when no rule has been set.
+    pub fn route_for(&self, class: MessageClass) -> AgentChoice {
+        self.routing
+            .get(&class)
+            .copied()
+            .unwrap_or(AgentChoice::Primary)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +66,7 @@ pub struct TelegramBotConfig {
 pub struct FileConfig {
     pub primary_agent: Option<LlmConfig>,
     pub telegram: Option<TelegramBotConfig>,
+    pub advisor: Option<AdvisorConfig>,
 }
 
 impl AgentConfig {
@@ -52,6 +82,7 @@ impl AgentConfig {
             telegram_token: None,
             telegram_allowed_chats: BTreeSet::new(),
             primary_agent: None,
+            advisor: None,
         }
     }
 
@@ -84,6 +115,7 @@ impl AgentConfig {
                     .unwrap_or_default()
             });
         config.primary_agent = file_config.primary_agent.or_else(env_llm_config);
+        config.advisor = file_config.advisor;
         config
     }
 }
@@ -105,9 +137,33 @@ pub fn read_file_config(workspace: &std::path::Path) -> FileConfig {
             provider: extract_json_string(primary, "provider")?,
             url: extract_json_string(primary, "url")?,
             model: extract_json_string(primary, "model")?,
-            thinking: extract_json_bool(primary, "thinking").unwrap_or(false),
             api_key: extract_json_string(primary, "api_key"),
+            thinking: extract_json_bool(primary, "thinking").unwrap_or(false),
         })
+    });
+
+    let advisor_agent = extract_object(&text, "advisor").and_then(|advisor| {
+        Some(LlmConfig {
+            provider: extract_json_string(advisor, "provider")?,
+            url: extract_json_string(advisor, "url")?,
+            model: extract_json_string(advisor, "model")?,
+            api_key: extract_json_string(advisor, "api_key"),
+            thinking: extract_json_bool(advisor, "thinking").unwrap_or(false),
+        })
+    });
+
+    let advisor = advisor_agent.map(|agent| {
+        let block = extract_object(&text, "advisor_mode");
+        let mode = block
+            .and_then(|inner| extract_json_string(inner, "mode"))
+            .and_then(|raw| AdvisorMode::parse(&raw))
+            .unwrap_or(AdvisorMode::Trial);
+        let routing = block.map(parse_routing_block).unwrap_or_default();
+        AdvisorConfig {
+            mode,
+            agent,
+            routing,
+        }
     });
 
     let telegram = extract_object(&text, "telegram").and_then(|telegram| {
@@ -121,7 +177,27 @@ pub fn read_file_config(workspace: &std::path::Path) -> FileConfig {
     FileConfig {
         primary_agent,
         telegram,
+        advisor,
     }
+}
+
+fn parse_routing_block(block: &str) -> BTreeMap<MessageClass, AgentChoice> {
+    let mut routing = BTreeMap::new();
+    let Some(routing_text) = extract_object(block, "routing") else {
+        return routing;
+    };
+    for class in [
+        MessageClass::MiniHow,
+        MessageClass::MiniWhy,
+        MessageClass::MiniWhat,
+    ] {
+        if let Some(raw) = extract_json_string(routing_text, &class.to_string()) {
+            if let Some(choice) = AgentChoice::parse(&raw) {
+                routing.insert(class, choice);
+            }
+        }
+    }
+    routing
 }
 
 pub fn write_primary_config(
@@ -129,6 +205,7 @@ pub fn write_primary_config(
     provider: &str,
     url: &str,
     model: &str,
+    api_key: Option<&str>,
 ) -> std::io::Result<()> {
     let mut file_config = read_file_config(workspace);
     let thinking = file_config.primary_agent.as_ref().map(|c| c.thinking).unwrap_or(false);
@@ -137,8 +214,8 @@ pub fn write_primary_config(
         provider: provider.to_owned(),
         url: url.to_owned(),
         model: model.to_owned(),
+        api_key: api_key.filter(|k| !k.is_empty()),
         thinking,
-        api_key,
     });
 
     fs::write(
@@ -180,6 +257,81 @@ pub fn pair_telegram_chat(workspace: &std::path::Path, chat_id: i64) -> std::io:
     Ok(inserted)
 }
 
+pub fn write_advisor_agent(
+    workspace: &std::path::Path,
+    provider: &str,
+    url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> std::io::Result<()> {
+    let mut file_config = read_file_config(workspace);
+    let agent = LlmConfig {
+        provider: provider.to_owned(),
+        url: url.to_owned(),
+        model: model.to_owned(),
+        api_key: api_key.filter(|k| !k.is_empty()).map(str::to_owned),
+        thinking: false,
+    };
+    file_config.advisor = Some(match file_config.advisor.take() {
+        Some(mut existing) => {
+            existing.agent = agent;
+            existing
+        }
+        None => AdvisorConfig::new(agent),
+    });
+
+    fs::write(
+        workspace.join("minipaw.json"),
+        render_file_config(&file_config),
+    )
+}
+
+pub fn write_advisor_mode(
+    workspace: &std::path::Path,
+    mode: AdvisorMode,
+) -> std::io::Result<()> {
+    let mut file_config = read_file_config(workspace);
+    let Some(advisor) = file_config.advisor.as_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "advisor agent is not configured",
+        ));
+    };
+    advisor.mode = mode;
+    fs::write(
+        workspace.join("minipaw.json"),
+        render_file_config(&file_config),
+    )
+}
+
+pub fn write_advisor_route(
+    workspace: &std::path::Path,
+    class: MessageClass,
+    choice: AgentChoice,
+) -> std::io::Result<()> {
+    let mut file_config = read_file_config(workspace);
+    let Some(advisor) = file_config.advisor.as_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "advisor agent is not configured",
+        ));
+    };
+    advisor.routing.insert(class, choice);
+    fs::write(
+        workspace.join("minipaw.json"),
+        render_file_config(&file_config),
+    )
+}
+
+pub fn clear_advisor(workspace: &std::path::Path) -> std::io::Result<()> {
+    let mut file_config = read_file_config(workspace);
+    file_config.advisor = None;
+    fs::write(
+        workspace.join("minipaw.json"),
+        render_file_config(&file_config),
+    )
+}
+
 pub fn unpair_telegram_chat(workspace: &std::path::Path, chat_id: i64) -> std::io::Result<bool> {
     let mut file_config = read_file_config(workspace);
     let Some(telegram) = file_config.telegram.as_mut() else {
@@ -197,64 +349,96 @@ pub fn unpair_telegram_chat(workspace: &std::path::Path, chat_id: i64) -> std::i
 }
 
 pub fn render_file_config(config: &FileConfig) -> String {
-    let mut out = String::from("{\n");
-    if let Some(primary) = &config.primary_agent {
-        out.push_str("  \"agents\": {\n");
-        out.push_str("    \"primary\": {\n");
-        out.push_str(&format!(
-            "      \"provider\": \"{}\",\n",
-            json_escape(&primary.provider)
-        ));
-        out.push_str(&format!(
-            "      \"url\": \"{}\",\n",
-            json_escape(&primary.url)
-        ));
-        if let Some(api_key) = &primary.api_key {
-            out.push_str(&format!(
-                "      \"model\": \"{}\",\n",
-                json_escape(&primary.model)
-            ));
-            out.push_str(&format!(
-                "      \"api_key\": \"{}\"\n",
-                json_escape(api_key)
-            ));
-        } else {
-            out.push_str(&format!(
-                "      \"model\": \"{}\"\n",
-                json_escape(&primary.model)
-            ));
+    let mut sections: Vec<String> = Vec::new();
+
+    let advisor_agent = config.advisor.as_ref().map(|a| &a.agent);
+    if config.primary_agent.is_some() || advisor_agent.is_some() {
+        let mut block = String::from("  \"agents\": {\n");
+        let mut entries = Vec::new();
+        if let Some(primary) = &config.primary_agent {
+            entries.push(render_named_agent("primary", primary, 4));
         }
-        out.push_str("    }\n");
-        out.push_str("  }");
+        if let Some(agent) = advisor_agent {
+            entries.push(render_named_agent("advisor", agent, 4));
+        }
+        block.push_str(&entries.join(",\n"));
+        block.push('\n');
+        block.push_str("  }");
+        sections.push(block);
+    }
+
+    if let Some(advisor) = &config.advisor {
+        let mut block = String::from("  \"advisor_mode\": {\n");
+        block.push_str(&format!(
+            "    \"mode\": \"{}\"",
+            json_escape(&advisor.mode.to_string())
+        ));
+        if !advisor.routing.is_empty() {
+            block.push_str(",\n    \"routing\": {\n");
+            let routing_entries: Vec<String> = advisor
+                .routing
+                .iter()
+                .map(|(class, choice)| {
+                    format!(
+                        "      \"{}\": \"{}\"",
+                        json_escape(&class.to_string()),
+                        json_escape(&choice.to_string())
+                    )
+                })
+                .collect();
+            block.push_str(&routing_entries.join(",\n"));
+            block.push_str("\n    }\n");
+        } else {
+            block.push('\n');
+        }
+        block.push_str("  }");
+        sections.push(block);
     }
 
     if let Some(telegram) = &config.telegram {
-        if config.primary_agent.is_some() {
-            out.push_str(",\n");
-        }
-        out.push_str("  \"telegram\": {\n");
-        out.push_str(&format!(
+        let mut block = String::from("  \"telegram\": {\n");
+        block.push_str(&format!(
             "    \"bot_token\": \"{}\",\n",
             json_escape(&telegram.token)
         ));
-        out.push_str("    \"allowed_chats\": [");
+        block.push_str("    \"allowed_chats\": [");
         for (index, chat) in telegram.allowed_chats.iter().enumerate() {
             if index > 0 {
-                out.push_str(", ");
+                block.push_str(", ");
             }
-            out.push_str(&chat.to_string());
+            block.push_str(&chat.to_string());
         }
-        out.push_str("]\n");
-        out.push_str("  }");
+        block.push_str("]\n");
+        block.push_str("  }");
+        sections.push(block);
     }
 
-    if config.primary_agent.is_none() && config.telegram.is_none() {
-        out.push('\n');
-    } else {
+    let mut out = String::from("{\n");
+    out.push_str(&sections.join(",\n"));
+    if !sections.is_empty() {
         out.push('\n');
     }
     out.push_str("}\n");
     out
+}
+
+fn render_named_agent(name: &str, llm: &LlmConfig, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let inner_pad = " ".repeat(indent + 2);
+    let mut lines = vec![
+        format!("\"provider\": \"{}\"", json_escape(&llm.provider)),
+        format!("\"url\": \"{}\"", json_escape(&llm.url)),
+        format!("\"model\": \"{}\"", json_escape(&llm.model)),
+    ];
+    if let Some(key) = llm.api_key.as_deref().filter(|k| !k.is_empty()) {
+        lines.push(format!("\"api_key\": \"{}\"", json_escape(key)));
+    }
+    let body = lines
+        .into_iter()
+        .map(|line| format!("{inner_pad}{line}"))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("{pad}\"{}\": {{\n{body}\n{pad}}}", json_escape(name))
 }
 
 fn env_llm_config() -> Option<LlmConfig> {
@@ -262,10 +446,10 @@ fn env_llm_config() -> Option<LlmConfig> {
         provider: env::var("MINIPAW_LLM_PROVIDER").ok()?,
         url: env::var("MINIPAW_LLM_URL").ok()?,
         model: env::var("MINIPAW_LLM_MODEL").ok()?,
+        api_key: env::var("MINIPAW_LLM_API_KEY").ok().filter(|k| !k.is_empty()),
         thinking: env::var("MINIPAW_LLM_THINKING").is_ok_and(|v| {
             matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
         }),
-        api_key: env::var("MINIPAW_LLM_API_KEY").ok(),
     })
 }
 
@@ -444,13 +628,14 @@ mod tests {
                 provider: "llamacpp".into(),
                 url: "http://host/v1".into(),
                 model: "qwen9b".into(),
-                thinking: false,
                 api_key: None,
+                thinking: false,
             }),
             telegram: Some(TelegramBotConfig {
                 token: "123:abc".into(),
                 allowed_chats: BTreeSet::from([10]),
             }),
+            advisor: None,
         };
 
         let rendered = render_file_config(&config);
@@ -458,5 +643,48 @@ mod tests {
         assert!(rendered.contains("\"primary\""));
         assert!(rendered.contains("\"telegram\""));
         assert!(rendered.contains("\"allowed_chats\": [10]"));
+    }
+
+    #[test]
+    fn renders_and_reparses_advisor_block() {
+        use crate::types::{AdvisorMode, AgentChoice, MessageClass};
+        let mut routing = BTreeMap::new();
+        routing.insert(MessageClass::MiniWhy, AgentChoice::Advisor);
+        routing.insert(MessageClass::MiniHow, AgentChoice::Primary);
+        let config = FileConfig {
+            primary_agent: Some(LlmConfig {
+                provider: "llamacpp".into(),
+                url: "http://host/v1".into(),
+                model: "qwen9b".into(),
+                api_key: None,
+                thinking: false,
+            }),
+            telegram: None,
+            advisor: Some(AdvisorConfig {
+                mode: AdvisorMode::Trial,
+                agent: LlmConfig {
+                    provider: "deepseek".into(),
+                    url: "https://api.deepseek.com/v1".into(),
+                    model: "deepseek-chat".into(),
+                    api_key: Some("sk-test".into()),
+                    thinking: false,
+                },
+                routing,
+            }),
+        };
+
+        let rendered = render_file_config(&config);
+        assert!(rendered.contains("\"advisor\""));
+        assert!(rendered.contains("\"deepseek-chat\""));
+        assert!(rendered.contains("\"advisor_mode\""));
+        assert!(rendered.contains("\"miniwhy\": \"advisor\""));
+
+        // round-trip parse
+        let advisor_block = extract_object(&rendered, "advisor_mode").unwrap();
+        let parsed_routing = parse_routing_block(advisor_block);
+        assert_eq!(
+            parsed_routing.get(&MessageClass::MiniWhy),
+            Some(&AgentChoice::Advisor)
+        );
     }
 }

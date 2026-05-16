@@ -48,9 +48,9 @@ impl LlmClient for OfflineLlm {
 pub struct LlamaCppClient {
     endpoint: HttpEndpoint,
     model: String,
+    api_key: Option<String>,
     thinking: bool,
     timeout: Duration,
-    api_key: Option<String>,
 }
 
 impl LlamaCppClient {
@@ -66,16 +66,12 @@ impl LlamaCppClient {
         Ok(Self {
             endpoint,
             model: config.model.clone(),
-            thinking: config.thinking,
-            timeout: if config.thinking {
-                Duration::from_secs(300)
-            } else {
-                Duration::from_secs(300)
-            },
             api_key: config
                 .api_key
                 .clone()
                 .filter(|key| !key.trim().is_empty()),
+            thinking: config.thinking,
+            timeout: Duration::from_secs(300),
         })
     }
 
@@ -339,8 +335,8 @@ mod tests {
 
     #[test]
     fn parses_endpoint() {
-        let endpoint = HttpEndpoint::parse("http://<endpoint-ip>:14416/v1").unwrap();
-        assert_eq!(endpoint.host, "<endpoint-ip>");
+        let endpoint = HttpEndpoint::parse("http://192.0.2.1:14416/v1").unwrap();
+        assert_eq!(endpoint.host, "192.0.2.1");
         assert_eq!(endpoint.port, 14416);
         assert_eq!(
             join_path(&endpoint.base_path, "/completions"),
