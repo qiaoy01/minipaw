@@ -765,7 +765,7 @@ def t_self_temp_chassis():
 
 @tool("self_network_link", "Network link status: hostname, default route reachable yes/no.")
 def t_self_network_link():
-    host = socket.gethostname()
+    host = "robot-sim"
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)

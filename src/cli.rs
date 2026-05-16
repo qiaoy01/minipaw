@@ -147,6 +147,7 @@ impl App {
             Some("onboarding") | Some("onboard") => self.onboarding(),
             Some("uninstall") => uninstall_from_env(&self.workspace, &args[1..]),
             Some("telegram") => self.telegram(&args[1..]),
+            Some("train") => self.train(&args[1..]),
             Some("help") | Some("--help") | Some("-h") => {
                 println!("{}", help_text());
                 Ok(0)
@@ -197,6 +198,7 @@ impl App {
                     text: input.to_owned(),
                     context_id: None,
                     source: "cli".to_owned(),
+                    subclass: None,
                 };
                 let report = self.core.process(msg);
                 writeln!(
@@ -211,10 +213,200 @@ impl App {
         Ok(0)
     }
 
+    fn train(&mut self, args: &[String]) -> io::Result<i32> {
+        // usage: minipaw train --manifest <file> [--max-attempts N] [--cross-check K]
+        //                     [--ids id1,id2,...] [--out <prefix>] [--include-pass]
+        let mut manifest_path: Option<String> = None;
+        let mut max_attempts: usize = 5;
+        let mut cross_check: usize = 2;
+        let mut retest_runs: usize = 1;
+        let mut ids_filter: Option<std::collections::HashSet<String>> = None;
+        let mut out_prefix: Option<String> = None;
+        let mut subclass_filter: Option<std::collections::HashSet<String>> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--manifest" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("--manifest requires a path");
+                        return Ok(2);
+                    }
+                    manifest_path = Some(args[i + 1].clone());
+                    i += 2;
+                }
+                "--max-attempts" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("--max-attempts requires N");
+                        return Ok(2);
+                    }
+                    max_attempts = args[i + 1].parse().unwrap_or(5);
+                    i += 2;
+                }
+                "--cross-check" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("--cross-check requires K");
+                        return Ok(2);
+                    }
+                    cross_check = args[i + 1].parse().unwrap_or(2);
+                    i += 2;
+                }
+                "--retest-runs" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("--retest-runs requires N");
+                        return Ok(2);
+                    }
+                    retest_runs = args[i + 1].parse::<usize>().unwrap_or(1).max(1);
+                    i += 2;
+                }
+                "--ids" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("--ids requires a comma-separated list");
+                        return Ok(2);
+                    }
+                    ids_filter = Some(
+                        args[i + 1]
+                            .split(',')
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
+                    i += 2;
+                }
+                "--subclass" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("--subclass requires a comma-separated list");
+                        return Ok(2);
+                    }
+                    subclass_filter = Some(
+                        args[i + 1]
+                            .split(',')
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
+                    i += 2;
+                }
+                "--out" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("--out requires a prefix");
+                        return Ok(2);
+                    }
+                    out_prefix = Some(args[i + 1].clone());
+                    i += 2;
+                }
+                "--help" | "-h" => {
+                    println!(
+                        "usage: minipaw train --manifest <file>\n\
+                         \x20      [--max-attempts N]    default 5\n\
+                         \x20      [--cross-check K]     cases per OTHER subclass for regression check, default 2; 0 disables\n\
+                         \x20      [--retest-runs N]     average baseline & retest over N runs to damp qwen9b variance, default 1\n\
+                         \x20      [--ids id1,id2,...]   train only these case ids\n\
+                         \x20      [--subclass s1,s2,...] train only cases whose subclass is in the list\n\
+                         \x20      [--out <prefix>]      write <prefix>.summary.md and <prefix>.jsonl"
+                    );
+                    return Ok(0);
+                }
+                other => {
+                    eprintln!("unknown train option: {other}");
+                    return Ok(2);
+                }
+            }
+        }
+
+        let Some(manifest_path) = manifest_path else {
+            eprintln!("--manifest required. Try --help.");
+            return Ok(2);
+        };
+        let text = match std::fs::read_to_string(&manifest_path) {
+            Ok(t) => t,
+            Err(err) => {
+                eprintln!("read manifest: {err}");
+                return Ok(2);
+            }
+        };
+        let mut cases = match crate::rubric::parse_manifest(&text) {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("parse manifest: {err}");
+                return Ok(2);
+            }
+        };
+        if let Some(ids) = ids_filter {
+            cases.retain(|c| ids.contains(&c.id));
+        }
+        if let Some(subs) = subclass_filter {
+            cases.retain(|c| subs.contains(&c.subclass));
+        }
+        if cases.is_empty() {
+            eprintln!("no cases selected after filters");
+            return Ok(2);
+        }
+
+        if !self.core.has_advisor() {
+            eprintln!(
+                "warning: no advisor configured — training will fall back to primary self-play"
+            );
+        }
+
+        let cfg = crate::train::TrainingConfig {
+            max_attempts,
+            cross_check_per_subclass: cross_check,
+            retest_runs,
+            class: crate::types::MessageClass::MiniHow,
+        };
+        println!(
+            "train: {} case(s), max_attempts={}, cross_check={}/subclass, retest_runs={}",
+            cases.len(),
+            cfg.max_attempts,
+            cfg.cross_check_per_subclass,
+            cfg.retest_runs
+        );
+
+        let report = crate::train::run_react_training(&mut self.core, &cases, &cfg);
+        let (summary, jsonl) = crate::train::render_report(&report);
+        println!("\n{}", summary);
+
+        if let Some(prefix) = out_prefix {
+            let summary_path = format!("{prefix}.summary.md");
+            let jsonl_path = format!("{prefix}.jsonl");
+            if let Err(err) = std::fs::write(&summary_path, &summary) {
+                eprintln!("write summary failed: {err}");
+            } else {
+                println!("wrote {summary_path}");
+            }
+            if let Err(err) = std::fs::write(&jsonl_path, &jsonl) {
+                eprintln!("write jsonl failed: {err}");
+            } else {
+                println!("wrote {jsonl_path}");
+            }
+        }
+
+        Ok(0)
+    }
+
     fn task(&mut self, args: &[String]) -> io::Result<i32> {
         match args.first().map(String::as_str) {
             Some("new") => {
-                let input = args[1..].join(" ");
+                let mut subclass: Option<String> = None;
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut i = 1;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--subclass" => {
+                            let Some(val) = args.get(i + 1) else {
+                                eprintln!("--subclass requires a value");
+                                return Ok(2);
+                            };
+                            subclass = Some(val.clone());
+                            i += 2;
+                        }
+                        other => {
+                            text_parts.push(other.to_owned());
+                            i += 1;
+                        }
+                    }
+                }
+                let input = text_parts.join(" ");
                 if input.trim().is_empty() {
                     eprintln!("task new requires text");
                     return Ok(2);
@@ -223,6 +415,7 @@ impl App {
                     text: input,
                     context_id: None,
                     source: "cli".to_owned(),
+                    subclass,
                 };
                 let report = self.core.process(msg);
                 println!(
@@ -982,6 +1175,7 @@ impl App {
                     text,
                     context_id: Some(chat_id.to_string()),
                     source: "telegram".to_owned(),
+                    subclass: None,
                 };
                 let report = self.core.process(msg);
                 let reply = format_session_report(&report);
@@ -1050,6 +1244,7 @@ impl App {
             text: routed,
             context_id: Some(session_key.to_owned()),
             source: "agent".to_owned(),
+            subclass: None,
         };
         let report = self.core.process(msg);
         print_gateway_event(
@@ -1288,6 +1483,7 @@ impl App {
                                     text,
                                     context_id: Some(chat_id.to_string()),
                                     source: "telegram".to_owned(),
+                                    subclass: None,
                                 };
                                 let report = self.core.process(msg);
                                 let reply = format_session_report(&report);

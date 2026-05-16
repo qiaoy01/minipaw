@@ -342,8 +342,8 @@ mod tests {
 
     #[test]
     fn parses_endpoint() {
-        let endpoint = HttpEndpoint::parse("http://<endpoint-ip>:14416/v1").unwrap();
-        assert_eq!(endpoint.host, "<endpoint-ip>");
+        let endpoint = HttpEndpoint::parse("http://192.0.2.1:14416/v1").unwrap();
+        assert_eq!(endpoint.host, "192.0.2.1");
         assert_eq!(endpoint.port, 14416);
         assert_eq!(
             join_path(&endpoint.base_path, "/completions"),

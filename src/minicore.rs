@@ -33,6 +33,12 @@ pub struct IncomingMessage {
     pub text: String,
     pub context_id: Option<String>,
     pub source: String,
+    /// Optional per-task subclass override. When set, minihow loads the
+    /// per-subclass overlay (e.g. `minihow.transport.md`) in addition to
+    /// the base prompt. Used by pawbench to tag each case with its category
+    /// during evaluation. At interactive runtime this is normally None
+    /// (classifier-driven subclass routing is Phase 2 work).
+    pub subclass: Option<String>,
 }
 
 pub struct SessionReport {
@@ -40,6 +46,35 @@ pub struct SessionReport {
     pub class: MessageClass,
     pub output: String,
     pub steps: usize,
+}
+
+/// Single EXEC step record collected during a minihow session — used by the
+/// rubric module to score training runs without parsing stdout.
+#[derive(Debug, Clone)]
+pub struct ExecRecord {
+    pub cmd: String,
+    pub ok: bool,
+    pub result: String,
+}
+
+/// Result of running one task end-to-end. `output` is the model's final
+/// answer (DONE: payload or last assistant turn), `steps` is the number of
+/// LLM turns consumed, `execs` is every EXEC the model issued in order.
+#[derive(Debug, Clone)]
+pub struct SessionTrace {
+    pub output: String,
+    pub steps: usize,
+    pub execs: Vec<ExecRecord>,
+}
+
+impl SessionTrace {
+    pub fn empty(output: String, steps: usize) -> Self {
+        Self {
+            output,
+            steps,
+            execs: Vec::new(),
+        }
+    }
 }
 
 pub struct MiniCore {
@@ -96,6 +131,117 @@ impl MiniCore {
 
     pub fn has_advisor(&self) -> bool {
         self.advisor.is_some()
+    }
+
+    pub fn prompts(&self) -> &PromptStore {
+        &self.prompts
+    }
+
+    pub fn skills_index_text(&self) -> String {
+        self.skills.index_text()
+    }
+
+    /// Reload the on-disk skill registry. Call after writing a new skill
+    /// file during training so subsequent primary runs see it.
+    pub fn reload_skills(&mut self) {
+        self.skills = SkillRegistry::load(&self.prompts.workspace().join("skills"));
+    }
+
+    /// Run one task in evaluation mode (no memory writes, robot_state snapshotted
+    /// so each call leaves the workspace state untouched). Used by the ReAct
+    /// trainer to score primary or advisor on a single case repeatedly.
+    /// `subclass` controls which per-subclass overlay is appended to the
+    /// minihow system prompt.
+    pub fn run_eval(
+        &mut self,
+        executor: AgentChoice,
+        task: &str,
+        subclass: Option<&str>,
+    ) -> SessionTrace {
+        let state_snap = snapshot_robot_state(self.prompts.workspace());
+        let task_id = TaskId(0);
+        let trace = match executor {
+            AgentChoice::Primary => {
+                let mut llm = std::mem::replace(&mut self.llm, Box::new(crate::llm::OfflineLlm));
+                let t = self.run_session_with_subclass(
+                    task_id,
+                    task,
+                    task,
+                    MessageClass::MiniHow,
+                    llm.as_mut(),
+                    false,
+                    subclass,
+                );
+                self.llm = llm;
+                t
+            }
+            AgentChoice::Advisor => {
+                let Some(mut llm) = self.advisor.take() else {
+                    return self.run_eval(AgentChoice::Primary, task, subclass);
+                };
+                let t = self.run_session_with_subclass(
+                    task_id,
+                    task,
+                    task,
+                    MessageClass::MiniHow,
+                    llm.as_mut(),
+                    false,
+                    subclass,
+                );
+                self.advisor = Some(llm);
+                t
+            }
+        };
+        restore_robot_state(self.prompts.workspace(), &state_snap);
+        trace
+    }
+
+    /// Ask advisor for one directive given explicit inputs (used by ReAct
+    /// loop). `prior_attempts` is a free-form text block that the
+    /// adjust-meta template can show advisor so it varies its proposal
+    /// across attempts. Returns None if no advisor configured or response
+    /// is unparseable.
+    pub fn ask_directive(
+        &mut self,
+        case_task: &str,
+        primary_output: &str,
+        advisor_output: &str,
+        class: MessageClass,
+        subclass: &str,
+        prior_attempts: &str,
+        rubric: &str,
+    ) -> Option<AdjustmentDirective> {
+        let current_main = self.prompts.read_class(class);
+        let overlay = self
+            .prompts
+            .read_subclass(class, subclass)
+            .unwrap_or_default();
+        let current_prompt = if overlay.is_empty() {
+            current_main
+        } else {
+            format!(
+                "{}\n\n[per-subclass overlay {}]\n{}",
+                current_main, subclass, overlay
+            )
+        };
+        let available_skills = self.skills.index_text();
+        let meta = self.prompts.render_adjust_meta(&[
+            ("class", &class.to_string()),
+            ("subclass", subclass),
+            ("task", case_task),
+            ("primary_output", primary_output),
+            ("advisor_output", advisor_output),
+            ("current_prompt", &current_prompt),
+            ("available_skills", &available_skills),
+            ("prior_attempts", prior_attempts),
+            ("rubric", rubric),
+        ]);
+        let advisor = self.advisor.as_mut()?;
+        let response = advisor.chat(
+            "You are minipaw's offline coach.",
+            &[ChatMessage::user(meta)],
+        );
+        parse_directive(class, &response)
     }
 
     pub fn register(&mut self, agent: Box<dyn AgentHandler>) {
@@ -177,25 +323,46 @@ impl MiniCore {
         self.memory.append_message(task_id, "user", &msg.text);
         self.memory.update_task_status(task_id, TaskStatus::Running);
 
-        let (output, steps) = self.run_with_executor(task_id, &msg.text, &context, class, executor);
+        // If we will shadow, snapshot the workspace's transient state (robot_state/)
+        // so the shadow can start from the same initial state the executor saw.
+        let shadow_planned = self.should_shadow(executor);
+        let initial_state = if shadow_planned {
+            Some(snapshot_robot_state(self.prompts.workspace()))
+        } else {
+            None
+        };
 
-        if self.should_shadow(executor) {
-            self.run_shadow(task_id, &context, class, executor, &output);
+        let trace = self.run_with_executor(
+            task_id,
+            &msg.text,
+            &context,
+            class,
+            executor,
+            msg.subclass.as_deref(),
+        );
+
+        if let Some(initial) = initial_state {
+            // Capture the executor's final state, run shadow against the pre-executor state,
+            // then restore executor's state so it remains the "official" run.
+            let exec_state = snapshot_robot_state(self.prompts.workspace());
+            restore_robot_state(self.prompts.workspace(), &initial);
+            self.run_shadow(task_id, &msg.text, &context, class, executor, &trace.output);
+            restore_robot_state(self.prompts.workspace(), &exec_state);
         }
 
-        let final_status = if output.starts_with("error:") {
+        let final_status = if trace.output.starts_with("error:") {
             TaskStatus::Failed
         } else {
             TaskStatus::Done
         };
         self.memory.update_task_status(task_id, final_status);
-        self.memory.append_message(task_id, "assistant", &output);
+        self.memory.append_message(task_id, "assistant", &trace.output);
 
         SessionReport {
             task_id,
             class,
-            output,
-            steps,
+            output: trace.output,
+            steps: trace.steps,
         }
     }
 
@@ -235,19 +402,38 @@ impl MiniCore {
         context: &str,
         class: MessageClass,
         executor: AgentChoice,
-    ) -> (String, usize) {
+        subclass: Option<&str>,
+    ) -> SessionTrace {
         match executor {
             AgentChoice::Primary => {
                 let mut llm = std::mem::replace(&mut self.llm, Box::new(crate::llm::OfflineLlm));
-                let result = self.run_session(task_id, input, context, class, llm.as_mut());
+                let result = self.run_session_with_subclass(
+                    task_id,
+                    input,
+                    context,
+                    class,
+                    llm.as_mut(),
+                    true,
+                    subclass,
+                );
                 self.llm = llm;
                 result
             }
             AgentChoice::Advisor => {
                 let Some(mut llm) = self.advisor.take() else {
-                    return self.run_with_executor(task_id, input, context, class, AgentChoice::Primary);
+                    return self.run_with_executor(
+                        task_id, input, context, class, AgentChoice::Primary, subclass,
+                    );
                 };
-                let result = self.run_session(task_id, input, context, class, llm.as_mut());
+                let result = self.run_session_with_subclass(
+                    task_id,
+                    input,
+                    context,
+                    class,
+                    llm.as_mut(),
+                    true,
+                    subclass,
+                );
                 self.advisor = Some(llm);
                 result
             }
@@ -257,6 +443,7 @@ impl MiniCore {
     fn run_shadow(
         &mut self,
         task_id: TaskId,
+        input: &str,
         context: &str,
         class: MessageClass,
         executor: AgentChoice,
@@ -266,10 +453,29 @@ impl MiniCore {
             AgentChoice::Primary => AgentChoice::Advisor,
             AgentChoice::Advisor => AgentChoice::Primary,
         };
-        let shadow_output = self.run_shadow_query(context, shadow_choice);
-        let Some(shadow) = shadow_output else {
-            return;
+        // Shadow now runs the full session with tool access (record_memory=false so
+        // the shadow's EXEC results don't pollute the executor's task transcript).
+        // The caller has already restored robot_state so shadow starts from the
+        // same initial state the executor saw.
+        let shadow_output = match shadow_choice {
+            AgentChoice::Primary => {
+                let mut llm = std::mem::replace(&mut self.llm, Box::new(crate::llm::OfflineLlm));
+                let trace = self.run_session(task_id, input, context, class, llm.as_mut(), false);
+                self.llm = llm;
+                trace.output
+            }
+            AgentChoice::Advisor => {
+                let Some(mut llm) = self.advisor.take() else { return };
+                let trace = self.run_session(task_id, input, context, class, llm.as_mut(), false);
+                self.advisor = Some(llm);
+                trace.output
+            }
         };
+        let trimmed = shadow_output.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let shadow = trimmed.to_owned();
 
         // Order outputs as (primary, advisor) regardless of which one served.
         let (primary_text, advisor_text) = match executor {
@@ -299,12 +505,17 @@ impl MiniCore {
             return;
         }
         let current_prompt = self.prompts.read_class(class);
+        let available_skills = self.skills.index_text();
         let meta = self.prompts.render_adjust_meta(&[
             ("class", &class.to_string()),
+            ("subclass", "(not used in legacy advisor mode)"),
             ("task", context),
             ("primary_output", primary_output),
             ("advisor_output", advisor_output),
             ("current_prompt", &current_prompt),
+            ("available_skills", &available_skills),
+            ("prior_attempts", "(not used in legacy advisor mode)"),
+            ("rubric", "(not used in legacy advisor mode — train command provides rubric)"),
         ]);
         let Some(advisor) = self.advisor.as_mut() else {
             return;
@@ -348,7 +559,7 @@ impl MiniCore {
         }
         let workspace = self.prompts.workspace().to_owned();
         match self.advisor_mode {
-            AdvisorMode::Training => match apply_training(&workspace, &self.prompts, &directive) {
+            AdvisorMode::Training => match apply_training(&workspace, &self.prompts, &directive, None) {
                 Ok(outcome) => {
                     println!(
                         "advisor adjust task={task_id} mode=training applied: {outcome}"
@@ -379,21 +590,6 @@ impl MiniCore {
                 Err(err) => eprintln!("advisor adjust proposal failed: {err}"),
             },
             AdvisorMode::Work => {}
-        }
-    }
-
-    fn run_shadow_query(&mut self, context: &str, target: AgentChoice) -> Option<String> {
-        let system = "You are a shadow advisor. Provide your best single-turn answer to the task below; do not request tools or further input.";
-        let messages = [ChatMessage::user(context.to_owned())];
-        let response = match target {
-            AgentChoice::Primary => self.llm.chat(system, &messages),
-            AgentChoice::Advisor => self.advisor.as_mut()?.chat(system, &messages),
-        };
-        let trimmed = response.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_owned())
         }
     }
 
@@ -439,11 +635,30 @@ impl MiniCore {
         context: &str,
         class: MessageClass,
         llm: &mut dyn LlmClient,
-    ) -> (String, usize) {
+        record_memory: bool,
+    ) -> SessionTrace {
+        self.run_session_with_subclass(task_id, input, context, class, llm, record_memory, None)
+    }
+
+    /// Same as `run_session` but renders the per-subclass overlay (if any)
+    /// into the minihow system prompt. Used by the ReAct trainer so primary
+    /// sees rules scoped to the current task subclass.
+    fn run_session_with_subclass(
+        &mut self,
+        task_id: TaskId,
+        input: &str,
+        context: &str,
+        class: MessageClass,
+        llm: &mut dyn LlmClient,
+        record_memory: bool,
+        subclass: Option<&str>,
+    ) -> SessionTrace {
         match class {
-            MessageClass::MiniHow => self.run_minihow(task_id, input, context, llm),
-            MessageClass::MiniWhy => self.run_miniwhy(task_id, context, llm),
-            MessageClass::MiniWhat => self.run_miniwhat(task_id, context, llm),
+            MessageClass::MiniHow => {
+                self.run_minihow(task_id, input, context, llm, record_memory, subclass)
+            }
+            MessageClass::MiniWhy => self.run_miniwhy(task_id, context, llm, record_memory),
+            MessageClass::MiniWhat => self.run_miniwhat(task_id, context, llm, record_memory),
         }
     }
 
@@ -454,11 +669,14 @@ impl MiniCore {
         input: &str,
         context: &str,
         llm: &mut dyn LlmClient,
-    ) -> (String, usize) {
+        record_memory: bool,
+        subclass: Option<&str>,
+    ) -> SessionTrace {
         let workspace = self.tools.policy().workspace.display().to_string();
         let skills_index = self.skills.index_text();
-        let system = self.prompts.render(
+        let system = self.prompts.render_with_subclass(
             MessageClass::MiniHow,
+            subclass,
             &[
                 ("soul", SOUL),
                 ("os", &self.os_info),
@@ -479,7 +697,14 @@ impl MiniCore {
         let mut steps = 0;
         let mut last_cmd: Option<String> = None;
         let mut last_result: Option<String> = None;
+        let mut execs: Vec<ExecRecord> = Vec::new();
         let max_steps = max_session_steps();
+
+        // Stdout label. Shadow runs use a different prefix so pawbench's
+        // `^minihow step=` regex doesn't accidentally count shadow's tool
+        // calls toward the executor's score (the executor is the only run
+        // whose transcript should drive verdicts).
+        let tag = if record_memory { "minihow" } else { "shadow" };
 
         for _ in 0..max_steps {
             steps += 1;
@@ -497,10 +722,12 @@ impl MiniCore {
             if directives.is_empty() {
                 // Free-form response — treat as the final answer.
                 let output = response.trim().to_owned();
-                println!("minihow free-form task={task_id} steps={steps}");
+                println!("{tag} free-form task={task_id} steps={steps}");
                 messages.push(ChatMessage::assistant(response));
-                self.memory.append_message(task_id, "advisor", &output);
-                return (output, steps);
+                if record_memory {
+                    self.memory.append_message(task_id, "advisor", &output);
+                }
+                return SessionTrace { output, steps, execs };
             }
 
             // Execute every EXEC in order until the first DONE (which terminates).
@@ -512,10 +739,12 @@ impl MiniCore {
                         Some(pos) => response[pos + "DONE:".len()..].trim().to_owned(),
                         None => d["DONE:".len()..].trim().to_owned(),
                     };
-                    println!("minihow done task={task_id} steps={steps}");
+                    println!("{tag} done task={task_id} steps={steps}");
                     messages.push(ChatMessage::assistant(response.clone()));
-                    self.memory.append_message(task_id, "advisor", &output);
-                    return (output, steps);
+                    if record_memory {
+                        self.memory.append_message(task_id, "advisor", &output);
+                    }
+                    return SessionTrace { output, steps, execs };
                 }
 
                 let Some(cmd) = d.strip_prefix("EXEC:") else { continue };
@@ -527,8 +756,10 @@ impl MiniCore {
                         if combined.is_empty() {
                             // Nothing executed this turn yet — return cached result.
                             let output = result.trim().to_owned();
-                            self.memory.append_message(task_id, "advisor", &output);
-                            return (output, steps);
+                            if record_memory {
+                                self.memory.append_message(task_id, "advisor", &output);
+                            }
+                            return SessionTrace { output, steps, execs };
                         }
                         // Otherwise fold the cached result into the combined feedback
                         // and stop executing further directives this turn so the LLM
@@ -542,17 +773,31 @@ impl MiniCore {
                 }
 
                 let result = self.dispatch_exec(cmd);
-                println!(
-                    "minihow step={steps} exec={cmd:?} ok={} out={:?}",
-                    !result.starts_with("error:"),
-                    &result[..result.len().min(120)]
-                );
+                let ok = !result.starts_with("error:");
+                execs.push(ExecRecord {
+                    cmd: cmd.to_owned(),
+                    ok,
+                    result: result.clone(),
+                });
+                if record_memory {
+                    println!(
+                        "{tag} step={steps} exec={cmd:?} ok={} out={:?}",
+                        ok,
+                        &result[..result.len().min(120)]
+                    );
+                } else {
+                    // Shadow runs: omit out= to avoid substring-pollution into
+                    // pawbench's must_in_exec scan. cmd is still useful for debug.
+                    println!("{tag} step={steps} exec={cmd:?} ok={}", ok);
+                }
 
-                self.memory.append_message(
-                    task_id,
-                    "exec",
-                    &format!("EXEC: {cmd}\nResult: {result}"),
-                );
+                if record_memory {
+                    self.memory.append_message(
+                        task_id,
+                        "exec",
+                        &format!("EXEC: {cmd}\nResult: {result}"),
+                    );
+                }
 
                 combined.push_str(&format!("Result of `{cmd}`:\n{result}\n\n"));
 
@@ -563,19 +808,21 @@ impl MiniCore {
             if combined.is_empty() {
                 // Directives were present but none was a real EXEC (e.g. malformed).
                 let output = response.trim().to_owned();
-                println!("minihow no-exec task={task_id} steps={steps}");
+                println!("{tag} no-exec task={task_id} steps={steps}");
                 messages.push(ChatMessage::assistant(response));
-                self.memory.append_message(task_id, "advisor", &output);
-                return (output, steps);
+                if record_memory {
+                    self.memory.append_message(task_id, "advisor", &output);
+                }
+                return SessionTrace { output, steps, execs };
             }
 
             messages.push(ChatMessage::assistant(response));
             messages.push(ChatMessage::user(combined.trim_end().to_owned()));
         }
 
-        eprintln!("minihow step-limit task={task_id}");
+        eprintln!("{tag} step-limit task={task_id}");
         let output = format!("Session reached step limit ({max_steps}).");
-        (output, steps)
+        SessionTrace { output, steps, execs }
     }
 
     // MiniWhy: analysis task — LLM reasons, may request memory data via DATA: directive.
@@ -584,7 +831,8 @@ impl MiniCore {
         task_id: TaskId,
         context: &str,
         llm: &mut dyn LlmClient,
-    ) -> (String, usize) {
+        record_memory: bool,
+    ) -> SessionTrace {
         let system = self
             .prompts
             .render(MessageClass::MiniWhy, &[("soul", SOUL)]);
@@ -608,8 +856,10 @@ impl MiniCore {
                     println!("miniwhy data-rejected task={task_id} query={query:?}");
                     let output = response.trim().to_owned();
                     messages.push(ChatMessage::assistant(response));
-                    self.memory.append_message(task_id, "advisor", &output);
-                    return (output, steps);
+                    if record_memory {
+                        self.memory.append_message(task_id, "advisor", &output);
+                    }
+                    return SessionTrace::empty(output, steps);
                 }
                 let memory = self.memory.progressive_memory(
                     query,
@@ -619,7 +869,9 @@ impl MiniCore {
                 );
                 let data = memory.render();
                 println!("miniwhy data-fetch task={task_id} query={query:?} bytes={}", data.len());
-                self.memory.append_message(task_id, "data-fetch", &data);
+                if record_memory {
+                    self.memory.append_message(task_id, "data-fetch", &data);
+                }
 
                 messages.push(ChatMessage::assistant(response));
                 messages.push(ChatMessage::user(format!("Data for '{query}':\n{data}")));
@@ -629,13 +881,15 @@ impl MiniCore {
             let output = response.trim().to_owned();
             println!("miniwhy done task={task_id} steps={steps}");
             messages.push(ChatMessage::assistant(response));
-            self.memory.append_message(task_id, "advisor", &output);
-            return (output, steps);
+            if record_memory {
+                self.memory.append_message(task_id, "advisor", &output);
+            }
+            return SessionTrace::empty(output, steps);
         }
 
         eprintln!("miniwhy step-limit task={task_id}");
         let output = format!("Analysis reached step limit ({max_steps}).");
-        (output, steps)
+        SessionTrace::empty(output, steps)
     }
 
     // MiniWhat: query task — single LLM call with SOUL + memory context in the system prompt.
@@ -644,7 +898,8 @@ impl MiniCore {
         task_id: TaskId,
         context: &str,
         llm: &mut dyn LlmClient,
-    ) -> (String, usize) {
+        record_memory: bool,
+    ) -> SessionTrace {
         println!("miniwhat task={task_id}");
         let memory = self.memory.progressive_memory(
             context,
@@ -659,8 +914,10 @@ impl MiniCore {
 
         let response = llm.chat(&system, &[ChatMessage::user(context.to_owned())]);
         let output = response.trim().to_owned();
-        self.memory.append_message(task_id, "advisor", &output);
-        (output, 1)
+        if record_memory {
+            self.memory.append_message(task_id, "advisor", &output);
+        }
+        SessionTrace::empty(output, 1)
     }
 
     fn dispatch_exec(&self, command: &str) -> String {
@@ -716,6 +973,46 @@ impl MiniCore {
         };
         println!("minicore skill-resolve from={head:?} to={result:?}");
         Some(result)
+    }
+}
+
+/// In-memory snapshot of files under `<workspace>/robot_state/`. Used to
+/// pin the executor's starting state so the shadow can rewind to it and
+/// run with tool access without contaminating the executor's transcript.
+/// Empty/None when the dir doesn't exist (typical for non-pawbench runs).
+type RobotStateSnapshot = Vec<(String, Vec<u8>)>;
+
+fn snapshot_robot_state(workspace: &std::path::Path) -> RobotStateSnapshot {
+    let state_dir = workspace.join("robot_state");
+    let Ok(entries) = std::fs::read_dir(&state_dir) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let (Some(name), Ok(bytes)) = (
+                path.file_name().and_then(|n| n.to_str()),
+                std::fs::read(&path),
+            ) {
+                files.push((name.to_owned(), bytes));
+            }
+        }
+    }
+    files
+}
+
+fn restore_robot_state(workspace: &std::path::Path, snapshot: &RobotStateSnapshot) {
+    let state_dir = workspace.join("robot_state");
+    if state_dir.exists() {
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+    if snapshot.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&state_dir);
+    for (name, bytes) in snapshot {
+        let _ = std::fs::write(state_dir.join(name), bytes);
     }
 }
 

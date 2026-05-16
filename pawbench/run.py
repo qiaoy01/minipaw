@@ -61,6 +61,21 @@ def _expand_alias_set(name: str) -> set[str]:
 # commas — covers both `paw.py robot_camera_capture` and the subprocess form
 # `paw.py', 'robot_move_status'`), then capture the tool identifier.
 PAW_TOOL_RE = re.compile(r"paw\.py[^a-zA-Z_]+([a-zA-Z_]\w+)")
+# Bare skill-name form: when primary writes `EXEC: robot_X args` instead of
+# `EXEC: python3 ../tools/paw.py robot_X args`, minipaw's skill-resolver
+# expands it internally but the logged EXEC line keeps the bare form. Match
+# the `robot_*`/`self_*` naming convention so pawbench can still count it.
+BARE_SKILL_RE = re.compile(r"\b(robot_[a-z]\w*|self_[a-z]\w*)\b")
+
+
+def extract_tool_calls(cmd: str) -> list[str]:
+    """Extract paw-tool invocations from one EXEC command string. Prefer the
+    explicit paw.py form; fall back to bare skill names only if no paw.py
+    match was found (avoids double-counting on mixed cmds)."""
+    paw_form = PAW_TOOL_RE.findall(cmd)
+    if paw_form:
+        return paw_form
+    return BARE_SKILL_RE.findall(cmd)
 FINAL_HEADER_RE = re.compile(r"^t\d+ \[\w+\] steps=(\d+)\s*$", re.MULTILINE)
 
 
@@ -111,8 +126,13 @@ def env_for_run() -> dict:
 def run_case(case: dict, timeout: int) -> dict:
     reset_workspace()
     started = time.time()
+    args = [str(BIN), "task", "new"]
+    category = case.get("category")
+    if category:
+        args += ["--subclass", category]
+    args.append(case["input"])
     proc = subprocess.run(
-        [str(BIN), "task", "new", case["input"]],
+        args,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -139,7 +159,7 @@ def extract_metrics(run: dict, case: dict) -> dict:
     # OR in EXEC results gets counted, deduped per-occurrence (chained `; ` counts each).
     tool_calls: list[str] = []
     for _step, cmd, _ok in exec_lines:
-        tool_calls.extend(PAW_TOOL_RE.findall(cmd))
+        tool_calls.extend(extract_tool_calls(cmd))
 
     must_tools = case.get("must_tools", [])
     used_tools = set(tool_calls)
@@ -227,6 +247,19 @@ def classify_failure_mode(case: dict, metrics: dict, run: dict) -> str:
     return "other"
 
 
+def _read_primary_model() -> str:
+    """Return the primary agent's model id from workspace minipaw.json.
+    Falls back to a placeholder if the file is missing or malformed.
+    Endpoint URL is intentionally not surfaced in summaries, to avoid leaking
+    private IPs / hostnames."""
+    try:
+        with open(WORKSPACE / "minipaw.json") as f:
+            cfg = json.load(f)
+        return cfg["agents"]["primary"].get("model", "<model>")
+    except (OSError, KeyError, ValueError):
+        return "<model>"
+
+
 def write_summary(run_dir: Path, all_records: list[dict]) -> None:
     n = len(all_records)
     passes = sum(1 for r in all_records if r["verdict"] == "Pass")
@@ -252,11 +285,12 @@ def write_summary(run_dir: Path, all_records: list[dict]) -> None:
     )
     avg_tools_all = sum(r["metrics"]["tool_calls_total"] for r in all_records) / max(1, n)
 
+    endpoint_model = _read_primary_model()
     lines: list[str] = []
-    lines.append(f"# pawbench: minipaw + qwen9b multi-step tool-use benchmark")
+    lines.append(f"# pawbench: minipaw + {endpoint_model} multi-step tool-use benchmark")
     lines.append("")
     lines.append(f"- Run timestamp: {run_dir.name}")
-    lines.append(f"- Endpoint: http://<endpoint-ip>:14416/v1 (qwen9b)")
+    lines.append(f"- Primary model: {endpoint_model}")
     lines.append(f"- Cases: {n}")
     lines.append(f"- Pass: {passes}")
     lines.append(f"- Partial: {partials}")

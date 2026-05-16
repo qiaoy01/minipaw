@@ -43,13 +43,58 @@ impl PromptStore {
             .join(format!("{}.md", class))
     }
 
+    /// Path of the per-subclass overlay file (e.g.
+    /// `prompts/minihow.navigation.md`). Caller is responsible for
+    /// validating the subclass name.
+    fn subclass_path(&self, class: MessageClass, subclass: &str) -> PathBuf {
+        self.workspace
+            .join("prompts")
+            .join(format!("{}.{}.md", class, subclass))
+    }
+
     pub fn read_class(&self, class: MessageClass) -> String {
         let path = self.class_path(class);
         fs::read_to_string(&path).unwrap_or_else(|_| default_for(class).to_owned())
     }
 
+    /// Read a per-subclass overlay if it exists and contains
+    /// non-whitespace content. Returns None for missing or empty files —
+    /// callers should treat both as "no overlay".
+    pub fn read_subclass(&self, class: MessageClass, subclass: &str) -> Option<String> {
+        let path = self.subclass_path(class, subclass);
+        let content = fs::read_to_string(&path).ok()?;
+        if content.trim().is_empty() {
+            None
+        } else {
+            Some(content)
+        }
+    }
+
     pub fn render(&self, class: MessageClass, vars: &[(&str, &str)]) -> String {
         substitute(&self.read_class(class), vars)
+    }
+
+    /// Render the main class template, then append the per-subclass overlay
+    /// (if any). Both go through `{{var}}` substitution. Used during ReAct
+    /// training so primary sees rules scoped to the current task subclass.
+    pub fn render_with_subclass(
+        &self,
+        class: MessageClass,
+        subclass: Option<&str>,
+        vars: &[(&str, &str)],
+    ) -> String {
+        let mut out = substitute(&self.read_class(class), vars);
+        if let Some(sub) = subclass {
+            if let Some(overlay) = self.read_subclass(class, sub) {
+                let overlay_rendered = substitute(&overlay, vars);
+                out.push_str("\n\nSubclass rules (");
+                out.push_str(sub);
+                out.push_str("):\n");
+                out.push_str(overlay_rendered.trim_end());
+                out.push('\n');
+            }
+        }
+        out
     }
 
     pub fn read_adjust_meta(&self) -> String {
@@ -74,6 +119,59 @@ impl PromptStore {
         updated.push_str(&format!("{next}. {trimmed}\n"));
         fs::write(&path, &updated)?;
         Ok(next)
+    }
+
+    /// Append a numbered rule to the per-subclass overlay. Creates the file
+    /// on first write. Numbering is independent per subclass (each overlay
+    /// has its own rule sequence starting at 1).
+    pub fn append_rule_to_subclass(
+        &self,
+        class: MessageClass,
+        subclass: &str,
+        rule: &str,
+    ) -> io::Result<usize> {
+        let path = self.subclass_path(class, subclass);
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let next = next_rule_number(&text);
+        let trimmed = rule.trim();
+        let mut updated = if text.trim().is_empty() {
+            String::new()
+        } else {
+            let mut t = text.trim_end().to_owned();
+            t.push('\n');
+            t
+        };
+        updated.push_str(&format!("{next}. {trimmed}\n"));
+        fs::write(&path, &updated)?;
+        Ok(next)
+    }
+
+    /// Read raw bytes of the subclass overlay file (or empty string if
+    /// missing). Used as the snapshot value for ReAct stage/revert.
+    pub fn snapshot_subclass(&self, class: MessageClass, subclass: &str) -> String {
+        let path = self.subclass_path(class, subclass);
+        fs::read_to_string(&path).unwrap_or_default()
+    }
+
+    /// Write the subclass overlay file (creating if needed, deleting if the
+    /// content is empty). Used to revert a staged ReAct attempt.
+    pub fn restore_subclass(
+        &self,
+        class: MessageClass,
+        subclass: &str,
+        content: &str,
+    ) -> io::Result<()> {
+        let path = self.subclass_path(class, subclass);
+        if content.is_empty() {
+            if path.exists() {
+                fs::remove_file(&path)?;
+            }
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, content)
     }
 }
 

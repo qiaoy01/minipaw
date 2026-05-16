@@ -89,17 +89,27 @@ fn is_valid_skill_name(name: &str) -> bool {
 }
 
 /// Apply directly to live prompts/skills. Used in training mode.
+/// When `subclass` is Some, RULE_APPEND directives write to
+/// `<class>.<subclass>.md` (creating the file as needed). When None,
+/// they fall back to the global class file (legacy behavior).
 pub fn apply_training(
     workspace: &Path,
     prompts: &PromptStore,
     directive: &AdjustmentDirective,
+    subclass: Option<&str>,
 ) -> io::Result<String> {
     match directive {
         AdjustmentDirective::NoChange => Ok("no change".to_owned()),
-        AdjustmentDirective::RuleAppend { class, rule } => {
-            let n = prompts.append_rule(*class, rule)?;
-            Ok(format!("appended rule {n} to {class}.md"))
-        }
+        AdjustmentDirective::RuleAppend { class, rule } => match subclass {
+            Some(sub) => {
+                let n = prompts.append_rule_to_subclass(*class, sub, rule)?;
+                Ok(format!("appended rule {n} to {class}.{sub}.md"))
+            }
+            None => {
+                let n = prompts.append_rule(*class, rule)?;
+                Ok(format!("appended rule {n} to {class}.md"))
+            }
+        },
         AdjustmentDirective::SkillNew {
             name,
             description,
@@ -253,7 +263,7 @@ pub fn apply_proposal(
             format!("proposal {} is malformed", proposal.id),
         )
     })?;
-    let outcome = apply_training(workspace, prompts, &directive)?;
+    let outcome = apply_training(workspace, prompts, &directive, None)?;
     fs::remove_file(&proposal.path)?;
     Ok(outcome)
 }
@@ -392,6 +402,7 @@ mod tests {
                 class: MessageClass::MiniHow,
                 rule: "test rule".into(),
             },
+            None,
         )
         .unwrap();
         assert!(outcome.contains("rule"));

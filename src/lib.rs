@@ -10,7 +10,9 @@ pub mod minicore;
 pub mod orchestration;
 pub mod planner;
 pub mod prompts;
+pub mod rubric;
 pub mod skills;
+pub mod train;
 pub mod tools;
 pub mod types;
 
